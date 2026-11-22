@@ -1,0 +1,16 @@
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+.ignore
+.claude/
+
+# Builds (PyInstaller) and Python caches
+build/
+dist/
+__pycache__/
+
+# What the app writes next to itself: your settings, thumbnails and the images Windows is showing
+spanwyse.json
+thumbs/
+applied/
+spanwyse_wallpaper.png
+spanwyse_preview.png
