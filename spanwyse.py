@@ -10,10 +10,12 @@ in Windows' "Span" mode.
     python spanwyse.py --test   # checks the alignment math
     python make_icon.py         # regenerates spanwyse.ico
 """
+import base64
 import ctypes
 import ctypes.wintypes as w
 import functools
 import hashlib
+import io
 import json
 import math
 import os
@@ -31,9 +33,9 @@ from tkinter import font as tkfont
 import subprocess
 import threading
 
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps, ImageTk
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageStat, ImageTk
 
-VERSION = '1.0.1'
+VERSION = '1.1.0'
 FROZEN = getattr(sys, 'frozen', False)
 # Next to the .exe when packaged (PyInstaller unpacks __file__ into a temp folder).
 HERE = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
@@ -41,12 +43,14 @@ RES = getattr(sys, '_MEIPASS', HERE)  # bundled read-only files (the icon)
 CONFIG = os.path.join(HERE, 'spanwyse.json')
 APPLIED = os.path.join(HERE, 'applied')  # the per-monitor images Windows is showing
 THUMBS = os.path.join(HERE, 'thumbs')
+DAILY_DIR = os.path.join(HERE, 'daily')  # pictures of the day
 ICON = os.path.join(RES, 'spanwyse.ico')
 THUMB = (176, 100)
 IMAGE_EXT = ('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tif', '.tiff')
 RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
 MODES = ('In order', 'Random', 'Time of day')
 FILLS = ('Black fill', 'Blurred fill', 'Custom color…')
+DAILY = {'bing': 'Bing image of the day', 'wallhaven': 'Wallhaven top of the day'}
 
 # Palette shared with the icon: deep purple ink, cyan -> magenta accents.
 INK, PANEL, RAISED, HOVER, BORDER = '#120822', '#1a0f2e', '#261841', '#33214f', '#3a2a5a'
@@ -319,6 +323,73 @@ def cover(L, rect):
     iw, ih = L['size']
     s = max(rw / iw, rh / ih)
     L['place'] = [x + (rw - iw * s) / 2, y + (rh - ih * s) / 2, s]
+
+
+def overlaps(a, b):
+    return a[0] < b[0] + b[2] and b[0] < a[0] + a[2] and a[1] < b[1] + b[3] and b[1] < a[1] + a[3]
+
+
+def density(m):
+    """The monitor's pixels per mm."""
+    return m['px'][2] / m['mm'][2]
+
+
+def auto_fit(L, mons):
+    """Cover every monitor at the smallest scale (= cover their bounding box), then slide the image along the
+    axis with room to spare to where the screens show the most detail (edge energy on the preview), so less
+    of what matters falls into bezel gaps or the empty corner of an uneven layout. Flat images stay centred."""
+    u = union([m['mm'] for m in mons])
+    cover(L, u)
+    x, y, s = L['place']
+    spare = (L['size'][0] * s - u[2], L['size'][1] * s - u[3])
+    a = 0 if spare[0] > 0.5 else 1 if spare[1] > 0.5 else None
+    if a is None or L['angle']:  # same shape as the layout, or tilted (transparent corners aren't detail)
+        return
+    edges = L['preview'].convert('L').filter(ImageFilter.FIND_EDGES).crop(
+        (1, 1, L['preview'].width - 1, L['preview'].height - 1))  # the filter's own border isn't detail
+    k = edges.width / (L['size'][0] * s)  # edge-map pixels per mm
+    best = None
+    for i in range(41):
+        t = i / 40
+        o = [x, y]
+        o[a] = u[a] - spare[a] * t
+        score = 0
+        for m in mons:
+            r = m['mm']
+            b = [round((r[0] - o[0]) * k), round((r[1] - o[1]) * k),
+                 round((r[0] + r[2] - o[0]) * k), round((r[1] + r[3] - o[1]) * k)]
+            score += ImageStat.Stat(edges.crop(b)).sum[0] if b[2] > b[0] and b[3] > b[1] else 0
+        if best is None or (score, -abs(t - 0.5)) > best[0]:
+            best = ((score, -abs(t - 0.5)), o)
+    L['place'] = [*best[1], s]
+
+
+def softness(layers, m):
+    """How far the most enlarged image showing on monitor m is stretched there, in screen pixels per image
+    pixel: past about 1.3 it starts to look soft."""
+    return max((density(m) * L['place'][2] for L in layers if overlaps(layer_rect(L), m['mm'])), default=0)
+
+
+def template(mons):
+    """A canvas to paint a wallpaper on for this layout: the whole layout at the sharpest monitor's density,
+    each monitor outlined and labelled, what no screen shows in dark grey. An image of this size dropped
+    back on the layout covers it exactly (same shape), so it lands monitor for monitor."""
+    x0, y0, uw, uh = union([m['mm'] for m in mons])
+    k = max(density(m) for m in mons)
+    img = Image.new('RGB', (round(uw * k), round(uh * k)), (48, 48, 48))
+    d = ImageDraw.Draw(img)
+    font = ImageFont.truetype('segoeui.ttf', max(round(8 * k), 12))  # 8 mm tall, real size on the screen
+    line = max(round(k / 2), 2)
+    for m in mons:
+        x, y, mw, mh = m['mm']
+        b = [round((x - x0) * k), round((y - y0) * k), round((x + mw - x0) * k) - 1, round((y + mh - y0) * k) - 1]
+        d.rectangle(b, fill=(226, 226, 226), outline=(25, 227, 255), width=line)
+        cx, cy = (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+        d.line((cx, b[1], cx, b[3]), fill=(170, 170, 170), width=line)
+        d.line((b[0], cy, b[2], cy), fill=(170, 170, 170), width=line)
+        d.text((b[0] + 6 * k, b[1] + 5 * k), f"{m['name']}   {m['px'][2]} × {m['px'][3]} px   {mw:.0f} × {mh:.0f} mm",
+               fill=(70, 70, 70), font=font)
+    return img
 
 
 def render(src, place, rect, size, resample):
@@ -746,6 +817,69 @@ def update_in_place(exe, current=VERSION, api=f'https://api.github.com/repos/{RE
         return None, True
 
 
+DAILY_MAX = 80 << 20  # bytes; no wallpaper needs more, and it keeps a bad answer from filling the disk
+
+
+def fetch_daily(source, want):
+    """Today's picture from Bing or Wallhaven, saved in DAILY_DIR: (path, caption). `want` is the size in
+    pixels the layout needs (Wallhaven is asked for images at least that big, if it has any today). What comes
+    back is checked: only the services' own image hosts, a size limit, and it must decode as a picture.
+    Raises OSError, ValueError, KeyError, IndexError or a Pillow error when that fails."""
+    def get(url):
+        with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'Spanwyse'}), timeout=30) as r:
+            data = r.read(DAILY_MAX + 1)
+        if len(data) > DAILY_MAX:
+            raise ValueError(f'{url} is larger than {DAILY_MAX >> 20} MB')
+        return data
+
+    if source == 'bing':
+        info = json.loads(get('https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1&mkt=en-US'))['images'][0]
+        if not re.fullmatch(r'/th\?id=[\w.\-]+', info['urlbase']):
+            raise ValueError(f'unexpected Bing image {info["urlbase"]!r}')
+        url, caption = f'https://www.bing.com{info["urlbase"]}_UHD.jpg', info.get('copyright', '')
+    else:
+        query = 'https://wallhaven.cc/api/v1/search?categories=100&purity=100&ratios=landscape&sorting=toplist&topRange=1d'
+        found = (json.loads(get(f'{query}&atleast={want[0]}x{want[1]}'))['data'] or json.loads(get(query))['data'])[0]
+        url, caption = found['path'], found['url']
+        if not re.fullmatch(r'https://w\.wallhaven\.cc/full/\w+/wallhaven-\w+\.(jpg|png)', url):
+            raise ValueError(f'unexpected Wallhaven image {url!r}')
+    data = get(url)
+    with Image.open(io.BytesIO(data)) as im:  # too many pixels raises DecompressionBombError
+        im.verify()
+    os.makedirs(DAILY_DIR, exist_ok=True)
+    path = os.path.join(DAILY_DIR, f'{source}-{time.strftime("%Y-%m-%d")}{os.path.splitext(url)[1]}')
+    with open(path, 'wb') as f:
+        f.write(data)
+    for name in os.listdir(DAILY_DIR):  # yesterday's picture from the same source isn't needed any more
+        if name.startswith(source + '-') and os.path.join(DAILY_DIR, name) != path:
+            try:
+                os.remove(os.path.join(DAILY_DIR, name))
+            except OSError:
+                pass
+    return path, caption
+
+
+LOCK_SCRIPT = r'''$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$ext = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 }
+$op = $ext | Where-Object { $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' }
+$act = $ext | Where-Object { $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' }
+[Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime] | Out-Null
+[Windows.System.UserProfile.LockScreen, Windows.System.UserProfile, ContentType = WindowsRuntime] | Out-Null
+$get = $op.MakeGenericMethod([Windows.Storage.StorageFile]).Invoke($null, @([Windows.Storage.StorageFile]::GetFileFromPathAsync('{path}')))
+$get.Wait(-1) | Out-Null
+$act.Invoke($null, @([Windows.System.UserProfile.LockScreen]::SetImageFileAsync($get.Result))).Wait(-1) | Out-Null
+'''
+
+
+def set_lock_screen(path):
+    """Windows' lock screen picture, through the LockScreen API that PowerShell can reach (Python has no
+    binding without extra packages). Returns the running process: exit code 0 = set."""
+    script = LOCK_SCRIPT.replace('{path}', path.replace("'", "''"))
+    return subprocess.Popen(['powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand',
+                             base64.b64encode(script.encode('utf-16-le')).decode()], creationflags=0x08000000)
+
+
 def write_monitor_images(layers, mons, fill, prefix):
     """One PNG per monitor in APPLIED, with a fresh name each time (Windows caches by path)."""
     os.makedirs(APPLIED, exist_ok=True)
@@ -982,6 +1116,8 @@ class App:
         self.smooth = tk.BooleanVar(value=saved.get('smooth', True))
         self.stop_we = tk.BooleanVar(value=saved.get('stop_we', True))
         self.auto_update = tk.BooleanVar(value=saved.get('updates', True))
+        self.lock = tk.BooleanVar(value=saved.get('lock', False))
+        self.fetching = set()  # daily wallpapers whose picture is being downloaded
         self.context = self.context_return = None  # wallpaper forced by a rule, and the one to go back to
         self.adj_vars = {key: tk.DoubleVar(value=0) for key, _, _ in ADJUSTMENTS}
         self.adj_vars['angle'] = tk.DoubleVar(value=0)
@@ -1021,6 +1157,7 @@ class App:
             except OSError:
                 pass
             root.after(15000, self.check_updates)
+        root.after(5000, self.check_daily)
 
     # --- layout ---
     def build_ui(self, glyphs):
@@ -1044,11 +1181,14 @@ class App:
             anchor='w', pady=(4, 0))
         ttk.Checkbutton(foot, text='Stop Wallpaper Engine when applying', variable=self.stop_we,
                         command=self.store).pack(anchor='w', pady=(4, 0))
+        lock = ttk.Checkbutton(foot, text='Also set the lock screen', variable=self.lock, command=self.store)
+        lock.pack(anchor='w', pady=(4, 0))
+        self.tip(lock, 'Applying a wallpaper also makes the main monitor\'s part of it the Windows lock screen picture')
         upd = ttk.Checkbutton(foot, text='Check for updates automatically', variable=self.auto_update,
                               command=self.store)
         upd.pack(anchor='w', pady=(4, 0))
         self.tip(upd, 'At start and every six hours, Spanwyse asks GitHub for a newer version and installs it in '
-                      'place. Turn it off and nothing contacts the network.')
+                      'place. Turn it off and nothing contacts GitHub.')
         ttk.Label(foot, text='Ctrl+Alt+← / → anywhere: previous / next wallpaper', style='Muted.TLabel').pack(
             anchor='w', pady=(6, 0))
         ver = ttk.Label(foot, text=f'Spanwyse {VERSION}  ·  free and open source (MIT)  ·  check for updates',
@@ -1098,9 +1238,12 @@ class App:
         self.lib = lb = self.section(im, 'IMAGES', 'extended', [
             ('\uE710', self.add_to_library, 'Add images… (or drop files from Explorer)'),
             ('\uE8B7', self.watch_menu, 'Watched folders: new images in them appear here by themselves'),
+            ('\uE753', self.daily_menu, 'Picture of the day from Bing or Wallhaven, fitted across your monitors '
+                                         'and renewed every day'),
             ('\uE8E5', self.place_selected, 'Place selected in the layout (2 selected = one per monitor)'),
             ('\uE711', self.lib_remove, 'Remove from list (files stay on disk)')])
         self.watch_button = self.buttons['']
+        self.daily_button = self.buttons['']
         lb.bind('<Double-1>', self.place_selected)
         lb.bind('<Return>', self.place_selected)
         lb.bind('<Delete>', lambda e: self.lib_remove())
@@ -1119,7 +1262,8 @@ class App:
             self.tip(b, tip)
         for text, cmd, tip in (
                 ('Fit view', self.fit_canvas, 'Show all monitors'),
-                ('Fit image', self.fit_active, 'Selected image covers the selected monitor (right-click one), or all'),
+                ('Fit image', self.fit_active, 'Selected image covers the selected monitor (right-click one), or all of '
+                                                'them, slid to where the screens show the most of the picture'),
                 ('Split at seam', self.split_active,
                  'Cut the selected image where the monitors meet, so each piece can be aligned on its own'),
                 ('Flip', lambda: self.transform('flip'), 'Mirror the selected image'),
@@ -1478,6 +1622,78 @@ class App:
             self.lib.delete(key)
         self.store()
 
+    # --- pictures of the day ---
+    def daily_menu(self):
+        m = self.menu()
+        for source, name in DAILY.items():
+            m.add_command(label=name, command=lambda s=source: self.add_daily(s))
+        b = self.daily_button
+        m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
+
+    def add_daily(self, source):
+        """A wallpaper that gets the source's picture of the day, fitted across all monitors; applied once
+        today's picture is in."""
+        p = next((p for p in self.presets if p.get('daily') == source), None)
+        if p:
+            self.tree.selection_set(p['id'])
+            self.tree.see(p['id'])
+            self.select()
+        else:
+            p = self.new(DAILY[source])
+            p['daily'] = source
+            self.tree.item(p['id'], text=self.label(p))
+        p.pop('day', None)  # fetch now, even if today's picture is already in
+        self.fetch_daily(p, apply=True)
+
+    def check_daily(self):
+        """Every half hour: daily wallpapers that don't have today's picture yet go and get it."""
+        for p in self.presets:
+            if p.get('daily') and p.get('day') != time.strftime('%Y-%m-%d'):
+                self.fetch_daily(p)
+        self.root.after(30 * 60 * 1000, self.check_daily)
+
+    def fetch_daily(self, p, apply=False):
+        """Download in a thread; then fit the picture across the monitors, and show it if this wallpaper is
+        the one on screen (or was just added)."""
+        if p['id'] in self.fetching:
+            return
+        self.fetching.add(p['id'])
+        want = template(self.mons).size
+        result = []
+
+        def work():
+            try:
+                result.append(fetch_daily(p['daily'], want))
+            except (OSError, ValueError, KeyError, IndexError, SyntaxError, Image.DecompressionBombError) as e:
+                result.append(e)  # offline, the service changed its answer, or what came back isn't a picture
+
+        def done():
+            if not result:
+                return self.root.after(300, done)
+            self.fetching.discard(p['id'])
+            if p not in self.presets:  # deleted meanwhile
+                return
+            if isinstance(result[0], Exception):
+                if apply:
+                    self.status['text'] = f'Couldn\'t get the {DAILY[p["daily"]]}; it tries again every half hour.'
+                return
+            path, caption = result[0]
+            L = load_layer(path)
+            auto_fit(L, self.mons)
+            p['layers'] = [dict(path=path, place=L['place'], xf=[0, False], crop=None, angle=0, adj={})]
+            p['day'] = time.strftime('%Y-%m-%d')
+            if p is self.cur:  # reload the editor with the new picture
+                self.cur = None
+                self.select()
+            else:
+                self.set_thumb(p, [L])
+            self.store()
+            if apply or p['id'] == self.applied:
+                self.go(self.presets.index(p))
+                self.status['text'] = f'{p["name"]}: {caption}'
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(300, done)
+
     def place_selected(self, _=None):
         self.place_images([self.lib_paths[k] for k in self.lib.selection()])
 
@@ -1551,7 +1767,8 @@ class App:
 
     def label(self, p):
         rule = p.get('when') or {}
-        notes = [n for n in ('▶ slideshow' if p.get('show') else '', f'from {p["time"]}' if p.get('time') else '',
+        notes = [n for n in (f'new every day from {p["daily"].title()}' if p.get('daily') else '',
+                             '▶ slideshow' if p.get('show') else '', f'from {p["time"]}' if p.get('time') else '',
                              f'while {rule["app"]} runs' if rule.get('app') else '',
                              f'in {rule["theme"]} mode' if rule.get('theme') else '') if n]
         return '   ' + p['name'] + ('\n   ' + '  ·  '.join(notes) if notes else '')
@@ -1569,19 +1786,23 @@ class App:
         if self.cur:
             self.cur['layers'] = [dict(path=L['path'], place=L['place'], xf=L['xf'], crop=L['crop'],
                                        angle=L['angle'], adj=L['adj']) for L in self.layers] + self.missing
-            img = preview_image(self.layers, self.mons, fit_view([m['mm'] for m in self.mons], THUMB), THUMB,
-                                paper=False, fill=self.fill())
-            img.save(self.thumb_path(self.cur['id']))
-            self.thumbs[self.cur['id']] = ImageTk.PhotoImage(img)
-            self.tree.item(self.cur['id'], image=self.thumbs[self.cur['id']])
+            self.set_thumb(self.cur, self.layers)
         self.profiles[self.sig] = {m['id']: m['mm'] for m in self.mons}
         cfg = dict(profiles=self.profiles, presets=self.presets, library=self.library, applied=self.applied,
                    hidden=sorted(self.hidden), watch=self.watch,
                    rotate=dict(on=self.rot_on.get(), min=self.rot_min.get(), mode=self.rot_mode.get(),
                                unit=self.rot_unit.get()),
                    grid=dict(step=self.grid_step.get(), snap=self.grid_snap.get()),
-                   options=dict(smooth=self.smooth.get(), stop_we=self.stop_we.get(), updates=self.auto_update.get()))
+                   options=dict(smooth=self.smooth.get(), stop_we=self.stop_we.get(), updates=self.auto_update.get(),
+                                lock=self.lock.get()))
         json.dump(cfg, open(CONFIG, 'w', encoding='utf-8'), indent=2, ensure_ascii=False)
+
+    def set_thumb(self, p, layers):
+        img = preview_image(layers, self.mons, fit_view([m['mm'] for m in self.mons], THUMB), THUMB, paper=False,
+                            fill=p.get('fill', '#000000'))
+        img.save(self.thumb_path(p['id']))
+        self.thumbs[p['id']] = ImageTk.PhotoImage(img)
+        self.tree.item(p['id'], image=self.thumbs[p['id']])
 
     def select(self, _=None):
         """Load the focused wallpaper into the editor (with several selected, the one clicked last)."""
@@ -1836,6 +2057,15 @@ class App:
         self.applied = self.cur['id']
         self.store()
         self.status['text'] = f'Applied “{self.cur["name"]}”' + self.apply_note
+        main = next((m for m in self.mons if m['px'][:2] == [0, 0]), self.mons[0])
+        if self.lock.get() and main['id'] in files:
+            self.watch_lock(set_lock_screen(files[main['id']]))
+
+    def watch_lock(self, proc):
+        if proc.poll() is None:
+            self.root.after(500, self.watch_lock, proc)
+        elif proc.returncode:
+            self.status['text'] += '  (Windows didn\'t take the lock screen picture)'
 
     def preview_live(self):
         """Show the wallpaper on the real monitors for 15 s; keep it, or put the previous one back."""
@@ -1898,11 +2128,12 @@ class App:
         self.show_dialog(d, keep)
 
     def export_menu(self):
-        if not self.layers:
-            return
         m = self.menu()
-        m.add_command(label='Combined image (whole desktop)…', command=self.export_combined)
-        m.add_command(label='One image per monitor…', command=self.export_per_monitor)
+        if self.layers:
+            m.add_command(label='Combined image (whole desktop)…', command=self.export_combined)
+            m.add_command(label='One image per monitor…', command=self.export_per_monitor)
+            m.add_separator()
+        m.add_command(label='Template to paint on (this layout)…', command=self.export_template)
         b = self.export_button
         m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
 
@@ -1927,6 +2158,15 @@ class App:
             img = paint(self.layers, m['mm'], size, base=backdrop(self.layers, m['mm'], size, self.fill()))
             img.convert('RGB').save(os.path.join(folder, f'{self.safe_name()} - {m["name"]} {size[0]}x{size[1]}.png'))
         self.status['text'] = f'Exported {len(self.mons)} images to {folder}'
+
+    def export_template(self):
+        img = template(self.mons)
+        path = filedialog.asksaveasfilename(defaultextension='.png', filetypes=[('PNG', '*.png')],
+                                            initialfile=f'Spanwyse template {img.width}x{img.height}.png')
+        if path:
+            img.save(path)
+            self.status['text'] = (f'Saved {path}. Paint over it at this size, then place the result with no monitor '
+                                   'selected (double-click it in the list): it lands exactly on the layout.')
 
     def set_fill(self, _=None):
         if not self.cur:
@@ -2049,8 +2289,10 @@ class App:
                 continue
             if len(paths) > 1:
                 cover(L, left_to_right[i % len(left_to_right)]['mm'])
+            elif target or self.sel:
+                cover(L, target or self.sel)
             else:
-                cover(L, target or self.sel or union([m['mm'] for m in self.mons]))
+                auto_fit(L, self.mons)
             self.layers.append(L)
             self.active = L
         self.redraw()
@@ -2065,10 +2307,14 @@ class App:
             self.store()
 
     def fit_active(self):
-        """The selected image covers the selected monitor, or all of them if none is selected."""
+        """The selected image covers the selected monitor, or all of them if none is selected (placed to show
+        the most of the picture)."""
         if self.active:
             self.checkpoint()
-            cover(self.active, self.sel or union([m['mm'] for m in self.mons]))
+            if self.sel:
+                cover(self.active, self.sel)
+            else:
+                auto_fit(self.active, self.mons)
             self.redraw()
             self.store()
 
@@ -2332,6 +2578,12 @@ class App:
                                        f"{m['mm'][2]:.0f} × {m['mm'][3]:.0f} mm")
             lb = c.bbox(label)
             c.tag_lower(c.create_rectangle(lb[0] - 8, lb[1] - 4, lb[2] + 8, lb[3] + 4, fill=INK, outline=''), label)
+            soft = softness(self.layers, m)
+            if soft > 1.3:  # the image has fewer pixels than this screen shows there
+                warn = c.create_text(lb[0], lb[3] + 10, anchor='nw', fill=PINK, font=(FONT, 9, 'bold'),
+                                     text=f'Image enlarged {soft:.1f}× here: will look soft')
+                wb = c.bbox(warn)
+                c.tag_lower(c.create_rectangle(wb[0] - 8, wb[1] - 4, wb[2] + 8, wb[3] + 4, fill=INK, outline=''), warn)
         if not self.layers:
             u = box(union([m['mm'] for m in self.mons]), self.view)
             c.create_text((u[0] + u[2]) / 2, u[3] + 34, fill=MUTED, font=(FONT, 12),
@@ -2415,6 +2667,29 @@ def selftest():
     rules = [dict(when={'theme': 'dark'}), dict(), dict(when={'app': 'Game.exe'})]
     assert context_match(rules, {'game.exe': 1}, True) == 2
     assert (context_match(rules, {}, True), context_match(rules, {}, False)) == (0, None)
+    # Template: the layout at the sharpest density; placed back as a whole, it lands on it exactly.
+    t = template([dict(m, name='DISPLAY1') for m in mons])
+    k = 3840 / 697
+    assert abs(t.width - 1033 * k) < 1 and abs(t.height - 597 * k) < 1
+    back = dict(orig=t, place=None)
+    set_xf(back, (0, False))
+    auto_fit(back, mons)
+    assert all(abs(a - b) < 0.01 for a, b in zip(back['place'], (0, 0, 1 / k)))  # within 1/100 mm
+    # Auto-fit: covers everything at the smallest scale and slides to where the detail is. A wide layout
+    # (two landscape monitors side by side) shows a square image's top when only the top has detail.
+    wide = [dict(px=[0, 0, 1920, 1080], mm=[0, 0, 530, 300]), dict(px=[1920, 0, 1920, 1080], mm=[540, 0, 530, 300])]
+    sq = Image.new('RGB', (1000, 1000), 'gray')
+    ImageDraw.Draw(sq).text((100, 50), 'detail ' * 20, fill='white')
+    top = dict(orig=sq, place=None)
+    set_xf(top, (0, False))
+    auto_fit(top, wide)
+    assert top['place'][0] == 0 and top['place'][2] == 1.07 and -top['place'][1] <= 50 * 1.07  # text row on screen
+    flat = dict(orig=Image.new('RGB', (1000, 1000), 'gray'), place=None)
+    set_xf(flat, (0, False))
+    auto_fit(flat, wide)
+    assert flat['place'] == [0, -385, 1.07]  # nothing to prefer: centred
+    # Sharpness: screen pixels per image pixel on each monitor.
+    assert round(softness([line], mons[0]), 2) == round(3840 / 697 * 0.5, 2) and softness([red], mons[0]) == 0
     print('ok')
 
 
