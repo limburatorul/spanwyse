@@ -32,7 +32,7 @@ import threading
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps, ImageTk
 
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 FROZEN = getattr(sys, 'frozen', False)
 # Next to the .exe when packaged (PyInstaller unpacks __file__ into a temp folder).
 HERE = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
