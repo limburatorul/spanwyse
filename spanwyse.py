@@ -21,6 +21,7 @@ import math
 import os
 import random
 import re
+import shutil
 import sys
 import time
 import urllib.request
@@ -35,22 +36,28 @@ import threading
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageStat, ImageTk
 
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 FROZEN = getattr(sys, 'frozen', False)
 # Next to the .exe when packaged (PyInstaller unpacks __file__ into a temp folder).
 HERE = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
 RES = getattr(sys, '_MEIPASS', HERE)  # bundled read-only files (the icon)
-CONFIG = os.path.join(HERE, 'spanwyse.json')
-APPLIED = os.path.join(HERE, 'applied')  # the per-monitor images Windows is showing
-THUMBS = os.path.join(HERE, 'thumbs')
-DAILY_DIR = os.path.join(HERE, 'daily')  # pictures of the day
+# Settings and generated images live beside the other Protagonist Labs apps' (before 1.2 they sat next to
+# the exe; move_old_data() brings them over). apps\ holds a card per app, so the apps can find each other.
+LABS = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'), 'ProtagonistLabs')
+DATA = os.path.join(LABS, 'Spanwyse')
+SHARED_APPS = os.path.join(LABS, 'apps')
+CONFIG = os.path.join(DATA, 'spanwyse.json')
+APPLIED = os.path.join(DATA, 'applied')  # the per-monitor images Windows is showing
+THUMBS = os.path.join(DATA, 'thumbs')
+DAILY_DIR = os.path.join(DATA, 'daily')  # pictures of the day
 ICON = os.path.join(RES, 'spanwyse.ico')
 THUMB = (176, 100)
 IMAGE_EXT = ('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tif', '.tiff')
 RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
 MODES = ('In order', 'Random', 'Time of day')
 FILLS = ('Black fill', 'Blurred fill', 'Custom color…')
-DAILY = {'bing': 'Bing image of the day', 'wallhaven': 'Wallhaven top of the day'}
+DAILY = {'bing': 'Bing image of the day', 'wallhaven': 'Wallhaven top of the day',
+         'wikimedia': 'Wikimedia Commons picture of the day'}
 
 # Palette shared with the icon: deep purple ink, cyan -> magenta accents.
 INK, PANEL, RAISED, HOVER, BORDER = '#120822', '#1a0f2e', '#261841', '#33214f', '#3a2a5a'
@@ -370,6 +377,94 @@ def softness(layers, m):
     return max((density(m) * L['place'][2] for L in layers if overlaps(layer_rect(L), m['mm'])), default=0)
 
 
+def seam_pairs(mons):
+    """(axis, first, second) for every seam: a = 0 for monitors side by side, 1 for stacked ones; `second` is
+    the nearest monitor beyond `first`'s edge that faces it."""
+    out = []
+    for a in (0, 1):
+        b = 1 - a
+        for m in mons:
+            r = m['mm']
+            beyond = [n for n in mons if n['mm'][a] >= r[a] + r[a + 2] - 1
+                      and n['mm'][b] < r[b] + r[b + 2] and r[b] < n['mm'][b] + n['mm'][b + 2]]
+            if beyond:
+                out.append((a, m, min(beyond, key=lambda n: n['mm'][a])))
+    return out
+
+
+def seam_loupe(layers, mons, fill, at, size=(440, 280), scale=14):
+    """What two monitors will show on either side of the seam nearest `at` (a point in mm): their own pixels,
+    snapped to their own pixel grid, joined without the bezel gap at one physical scale (`scale` loupe pixels
+    per mm). A line that crosses the seam must meet in here. (image, (first, second)) or None for one monitor."""
+    best = None
+    for a, m1, m2 in seam_pairs(mons):
+        b = 1 - a
+        r1, r2 = m1['mm'], m2['mm']
+        lo, hi = max(r1[b], r2[b]), min(r1[b] + r1[b + 2], r2[b] + r2[b + 2])  # where they face each other
+        along = min(max(at[b], lo), hi)
+        d = abs(at[a] - (r1[a] + r1[a + 2] + r2[a]) / 2) + abs(at[b] - along)
+        if best is None or d < best[0]:
+            best = (d, a, m1, m2, along)
+    if not best:
+        return None
+    _, a, m1, m2, along = best
+    b = 1 - a
+    half, span = size[a] / 2 / scale, size[b] / scale  # mm shown on each side of the seam, and along it
+    out = Image.new('RGB', size, PAPER)
+    for m, side in ((m1, 0), (m2, 1)):
+        r, k = m['mm'], density(m)
+        edge = r[a] + r[a + 2] if side == 0 else r[a]
+        lo_a, hi_a = (max(edge - half, r[a]), edge) if side == 0 else (edge, min(edge + half, r[a] + r[a + 2]))
+        lo_b, hi_b = max(along - span / 2, r[b]), min(along + span / 2, r[b] + r[b + 2])
+        if hi_b <= lo_b:
+            continue
+        # whole pixels of this monitor
+        lo_a, hi_a, lo_b, hi_b = (r[a] + math.floor((lo_a - r[a]) * k) / k, r[a] + math.ceil((hi_a - r[a]) * k) / k,
+                                  r[b] + math.floor((lo_b - r[b]) * k) / k, r[b] + math.ceil((hi_b - r[b]) * k) / k)
+        rect, n = [0] * 4, [0, 0]
+        rect[a], rect[a + 2], rect[b], rect[b + 2] = lo_a, hi_a - lo_a, lo_b, hi_b - lo_b
+        n[a], n[b] = max(round(rect[a + 2] * k), 1), max(round(rect[b + 2] * k), 1)
+        pix = paint(layers, rect, tuple(n), base=backdrop(layers, rect, tuple(n), fill, part_of=r)).convert('RGB')
+        big = pix.resize((max(round(rect[2] * scale), 1), max(round(rect[3] * scale), 1)), Image.NEAREST)
+        at_px = [0, 0]
+        at_px[a] = round((lo_a - (edge - half)) * scale) if side == 0 else round(size[a] / 2 + (lo_a - edge) * scale)
+        at_px[b] = round((lo_b - (along - span / 2)) * scale)
+        out.paste(big, tuple(at_px))
+    d = ImageDraw.Draw(out)
+    c = size[a] // 2
+    for t in ((0, 10), (size[b] - 10, size[b])):  # ticks marking the seam, off the pixels that matter
+        d.line((c, t[0], c, t[1]) if a == 0 else (t[0], c, t[1], c), fill=PINK, width=2)
+    return out, (m1, m2)
+
+
+DRIFT_STEP, DRIFT_PERIOD, DRIFT_ZOOM = 180, 5400, 0.06  # s between frames, s per loop, how far it zooms in
+
+
+def drift(layers, mons, t):
+    """The wallpaper's images, slowly zoomed in and panned (a Ken Burns move): at time t (s) on a loop of
+    DRIFT_PERIOD. Whatever covered a monitor keeps covering it: a move that would bare an edge is made
+    smaller until it doesn't. Returns new layer dicts; the originals aren't touched."""
+    u = union([m['mm'] for m in mons])
+    cx, cy = u[0] + u[2] / 2, u[1] + u[3] / 2
+    phase = 2 * math.pi * t / DRIFT_PERIOD
+    f = 1 + DRIFT_ZOOM * (1 - math.cos(phase)) / 2
+    pan = ((f - 1) * u[2] / 2 * math.sin(phase * 2), (f - 1) * u[3] / 2 * math.sin(phase * 3))
+    probes = [(m['mm'][0] + m['mm'][2] * i / 8, m['mm'][1] + m['mm'][3] * j / 8)
+              for m in mons for i in range(9) for j in range(9)]
+
+    def covered(ls):
+        return {q for q in probes for L in ls if overlaps(layer_rect(L), (q[0] - 0.01, q[1] - 0.01, 0.02, 0.02))}
+
+    need = covered(layers)
+    for shrink in (1, 0.5, 0.25, 0.1, 0):
+        g, dx, dy = 1 + (f - 1) * shrink, pan[0] * shrink, pan[1] * shrink
+        moved = [dict(L, place=[cx + (L['place'][0] - cx) * g + dx, cy + (L['place'][1] - cy) * g + dy,
+                                L['place'][2] * g]) for L in layers]
+        if need <= covered(moved):
+            return moved
+    return list(layers)
+
+
 def template(mons):
     """A canvas to paint a wallpaper on for this layout: the whole layout at the sharpest monitor's density,
     each monitor outlined and labelled, what no screen shows in dark grey. An image of this size dropped
@@ -613,17 +708,42 @@ def stop_wallpaper_engine(procs):
     return False
 
 
-def context_match(presets, procs, dark):
-    """Index of the wallpaper whose rule holds right now: running apps first (list order), then the
-    Windows theme. None if no rule holds."""
-    for kind in ('app', 'theme'):
+def context_match(presets, procs, dark, desktop=None):
+    """Index of the wallpaper whose rule holds right now: running apps first (list order), then the virtual
+    desktop on screen, then the Windows theme. None if no rule holds."""
+    for kind in ('app', 'desktop', 'theme'):
         for i, p in enumerate(presets):
             rule = p.get('when') or {}
             if kind == 'app' and rule.get('app', '').lower() in procs:
                 return i
+            if kind == 'desktop' and rule.get('desktop') and rule['desktop'] == desktop:
+                return i
             if kind == 'theme' and rule.get('theme') and (rule['theme'] == 'dark') == dark:
                 return i
     return None
+
+
+VD_KEY = r'Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops'
+
+
+def virtual_desktops():
+    """([(id, name)] in Windows' order, id of the one on screen). Explorer writes both to the registry once a
+    second desktop has existed (with one desktop it may not have yet: then ([], None))."""
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, VD_KEY)
+        ids, cur = (winreg.QueryValueEx(key, v)[0] for v in ('VirtualDesktopIDs', 'CurrentVirtualDesktop'))
+    except OSError:
+        return [], None
+    out = []
+    for n in range(len(ids) // 16):
+        g = str(uuid.UUID(bytes_le=bytes(ids[n * 16:n * 16 + 16])))
+        try:
+            name = winreg.QueryValueEx(winreg.OpenKey(winreg.HKEY_CURRENT_USER, rf'{VD_KEY}\Desktops\{{{g.upper()}}}'),
+                                       'Name')[0]
+        except OSError:
+            name = ''  # never renamed: Windows calls it by its number
+        out.append((g, name or f'Desktop {n + 1}'))
+    return out, str(uuid.UUID(bytes_le=bytes(cur))) if len(cur) == 16 else None
 
 
 def pick_by_time(presets, now):
@@ -775,30 +895,40 @@ def update_in_place(exe, current=VERSION, api=f'https://api.github.com/repos/{RE
     """In-place update, like the studio's other portable apps: the newest Spanwyse.exe from the GitHub release
     is downloaded beside the running one, checked against the size and SHA-256 GitHub publishes for it, and
     takes the old one's name (Windows lets a running exe be renamed; the old one becomes .old and is deleted
-    at the next start). Returns (version now waiting for the next start or None, whether the check failed):
-    failed means "couldn't check" (offline, GitHub busy, a file that didn't match), not "nothing newer"."""
+    at the next start). Returns (version now waiting for the next start or None, whether the check failed,
+    staged): failed means "couldn't check" (offline, GitHub busy, a file that didn't match), not "nothing
+    newer". When the exe's folder only takes administrators (Program Files), the checked download waits in
+    DATA instead and `staged` is its path: install_staged() puts it in place, with one prompt, on restart."""
     headers = {'User-Agent': 'Spanwyse', 'Accept': 'application/vnd.github+json'}
-    fresh, old = exe + '.new', exe + '.old'
+    fresh, old, staged = exe + '.new', exe + '.old', None
     try:
         with urllib.request.urlopen(urllib.request.Request(api, headers=headers), timeout=20) as r:
             release = json.load(r)
         latest = release['tag_name'].lstrip('vV')
         if version_tuple(latest) <= version_tuple(current):
-            return None, False
+            return None, False, None
         asset = next(a for a in release['assets'] if a['name'] == UPDATE_ASSET)
         digest = asset.get('digest') or ''
         if not digest.startswith('sha256:'):  # nothing to check it against: it doesn't get to run
-            return None, True
+            return None, True, None
+        try:
+            out = open(fresh, 'wb')
+        except PermissionError:
+            os.makedirs(DATA, exist_ok=True)
+            fresh = staged = os.path.join(DATA, UPDATE_ASSET + '.new')
+            out = open(fresh, 'wb')
         sha, size = hashlib.sha256(), 0
         with urllib.request.urlopen(urllib.request.Request(asset['browser_download_url'], headers=headers),
-                                    timeout=60) as r, open(fresh, 'wb') as f:
+                                    timeout=60) as r, out as f:
             for chunk in iter(lambda: r.read(1 << 20), b''):
                 f.write(chunk)
                 sha.update(chunk)
                 size += len(chunk)
         if size != asset['size'] or sha.hexdigest() != digest[7:].lower():  # cut short, or not the published file
             os.remove(fresh)
-            return None, True
+            return None, True, None
+        if staged:
+            return latest, False, staged
         if os.path.exists(old):
             os.remove(old)
         os.rename(exe, old)
@@ -807,16 +937,43 @@ def update_in_place(exe, current=VERSION, api=f'https://api.github.com/repos/{RE
         except OSError:
             os.rename(old, exe)  # the folder is never left without its exe
             raise
-        return latest, False
+        return latest, False, None
     except (OSError, ValueError, KeyError, TypeError, StopIteration):
         # Offline (URLError), rate limit or server error (HTTPError), an odd answer, a folder we can't write in.
         try:
             os.remove(fresh)
         except OSError:
             pass
-        return None, True
+        return None, True, None
 
 
+def file_sha(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def install_staged(exe, staged):
+    """Put a checked download into a folder only administrators can write in: one UAC prompt, then the old exe
+    is renamed aside (a running exe can be renamed, not overwritten) and the new one copied in, so it takes
+    the folder's permissions. True if the exe there is now the download."""
+    q = lambda path: path.replace("'", "''")
+    line = f'del /f /q "{exe}.old" 2>nul & move /y "{exe}" "{exe}.old" && copy /y "{staged}" "{exe}"'
+    script = f"Start-Process cmd -ArgumentList '/c {q(line)}' -Verb RunAs -Wait -WindowStyle Hidden"
+    subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand',
+                    base64.b64encode(script.encode('utf-16-le')).decode()], creationflags=0x08000000)
+    try:
+        if file_sha(exe) != file_sha(staged):  # prompt declined, or the copy didn't happen
+            return False
+        os.remove(staged)
+    except OSError:
+        return False
+    return True
+
+
+AGENT = f'Spanwyse/{VERSION} (https://protagonistlabs.app/spanwyse/)'  # Wikimedia asks for a contact
 DAILY_MAX = 80 << 20  # bytes; no wallpaper needs more, and it keeps a bad answer from filling the disk
 
 
@@ -826,7 +983,7 @@ def fetch_daily(source, want):
     back is checked: only the services' own image hosts, a size limit, and it must decode as a picture.
     Raises OSError, ValueError, KeyError, IndexError or a Pillow error when that fails."""
     def get(url):
-        with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'Spanwyse'}), timeout=30) as r:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': AGENT}), timeout=30) as r:
             data = r.read(DAILY_MAX + 1)
         if len(data) > DAILY_MAX:
             raise ValueError(f'{url} is larger than {DAILY_MAX >> 20} MB')
@@ -837,6 +994,15 @@ def fetch_daily(source, want):
         if not re.fullmatch(r'/th\?id=[\w.\-]+', info['urlbase']):
             raise ValueError(f'unexpected Bing image {info["urlbase"]!r}')
         url, caption = f'https://www.bing.com{info["urlbase"]}_UHD.jpg', info.get('copyright', '')
+    elif source == 'wikimedia':
+        info = json.loads(get('https://api.wikimedia.org/feed/v1/wikipedia/en/featured/' + time.strftime('%Y/%m/%d')))
+        info = info['image']
+        url = info['image']['source'].split('?')[0]
+        if not re.fullmatch(r'https://upload\.wikimedia\.org/wikipedia/commons/\w/\w\w/[^/?#]+\.(jpe?g|png)', url, re.I):
+            raise ValueError(f'unexpected Wikimedia image {url!r}')  # also: a video or a drawing today
+        # Commons pictures are free to use with credit: the author and the licence go with the picture.
+        caption = ' · '.join(t for t in ((info.get('artist') or {}).get('text', '').strip(),
+                                         (info.get('license') or {}).get('type', ''), 'Wikimedia Commons') if t)
     else:
         query = 'https://wallhaven.cc/api/v1/search?categories=100&purity=100&ratios=landscape&sorting=toplist&topRange=1d'
         found = (json.loads(get(f'{query}&atleast={want[0]}x{want[1]}'))['data'] or json.loads(get(query))['data'])[0]
@@ -880,16 +1046,95 @@ def set_lock_screen(path):
                              base64.b64encode(script.encode('utf-16-le')).decode()], creationflags=0x08000000)
 
 
-def write_monitor_images(layers, mons, fill, prefix):
-    """One PNG per monitor in APPLIED, with a fresh name each time (Windows caches by path)."""
+def move_old_data(folder=None):
+    """Once, at start, before anything is read: files kept beside the exe by earlier versions move to DATA.
+    Copied first (the exe's folder can be on another drive), then the config is written with its paths
+    pointing at the new place, Windows is pointed at the moved images it is showing (same pictures, so
+    nothing changes on screen), and only then are the old files deleted. If DATA already has a config,
+    nothing is mixed: the old files stay and move.log says so. If copying fails, this session keeps using
+    the old folder and the next start tries again. Returns the old folder if it moved, else None."""
+    global CONFIG, APPLIED, THUMBS, DAILY_DIR
+    old = folder or HERE
+    names = ('spanwyse.json', 'thumbs', 'applied', 'daily')
+    if not os.path.isfile(os.path.join(old, 'spanwyse.json')) or os.path.normcase(old) == os.path.normcase(DATA):
+        return None
+    if os.path.exists(CONFIG):
+        move_log(f'kept {old}: {DATA} already holds a config')
+        return None
+    try:
+        os.makedirs(DATA, exist_ok=True)
+        for name in names[1:]:
+            if os.path.isdir(os.path.join(old, name)):
+                shutil.copytree(os.path.join(old, name), os.path.join(DATA, name), dirs_exist_ok=True)
+        text = open(os.path.join(old, 'spanwyse.json'), encoding='utf-8').read()
+        # Pictures of the day were saved under the old folder; library images elsewhere are untouched.
+        was, now = (json.dumps(os.path.join(d, 'daily') + os.sep)[1:-1] for d in (old, DATA))
+        text = re.sub(re.escape(was), lambda _: now, text, flags=re.IGNORECASE)
+        json.loads(text)  # still valid
+        with open(CONFIG + '.tmp', 'w', encoding='utf-8') as f:
+            f.write(text)
+        os.replace(CONFIG + '.tmp', CONFIG)
+    except (OSError, ValueError):
+        CONFIG, APPLIED, THUMBS, DAILY_DIR = (os.path.join(old, n) for n in names)
+        return None
+    try:
+        desk = DesktopWallpaper()
+        shown = os.path.normcase(os.path.join(old, 'applied') + os.sep)
+        for mid in desk.ids():
+            path = desk.get(mid)
+            if os.path.normcase(path).startswith(shown):
+                desk.set(mid, os.path.join(APPLIED, path[len(shown):]))
+    except OSError:
+        pass  # Windows keeps showing its cached copy; the next apply points it at the new folder anyway
+    for name in names:
+        target = os.path.join(old, name)
+        try:
+            shutil.rmtree(target) if os.path.isdir(target) else os.remove(target)
+        except OSError:
+            pass
+    move_log(f'moved {old} to {DATA}')
+    return old
+
+
+def move_log(line):
+    try:
+        os.makedirs(DATA, exist_ok=True)
+        with open(os.path.join(DATA, 'move.log'), 'a', encoding='utf-8') as f:
+            f.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")} {line}\n')
+    except OSError:
+        pass
+
+
+def write_card(hotkeys):
+    """The card the other Protagonist Labs apps read (HotkeyScan names whoever holds a hotkey). Rewritten at
+    start with which hotkeys Spanwyse actually holds. Not from source: that exe is python.exe."""
+    if not FROZEN:
+        return
+    card = {'schema': 1, 'updated': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'id': 'spanwyse',
+            'name': 'Spanwyse', 'version': VERSION, 'exe': sys.executable, 'data': DATA, 'edition': 'free',
+            'paid': False, 'page': 'https://protagonistlabs.app/spanwyse/', 'commands': {},
+            'hotkeys': [{'combo': combo, 'does': does, 'registered': ok} for combo, does, ok in hotkeys]}
+    path = os.path.join(SHARED_APPS, 'spanwyse.json')
+    try:
+        os.makedirs(SHARED_APPS, exist_ok=True)
+        with open(path + '.tmp', 'w', encoding='utf-8') as f:
+            json.dump(card, f, indent=2)
+        os.replace(path + '.tmp', path)
+    except OSError:
+        pass
+
+
+def write_monitor_images(layers, mons, fill, prefix, jpeg=False):
+    """One image per monitor in APPLIED, with a fresh name each time (Windows caches by path). PNG; JPEG for
+    the drift's frames, which come every few minutes and would otherwise write gigabytes a day."""
     os.makedirs(APPLIED, exist_ok=True)
     stamp = time.strftime('%Y%m%d-%H%M%S') + f'-{uuid.uuid4().hex[:4]}'
     files = {}
     for m in mons:
         size = tuple(m['px'][2:])
-        path = os.path.join(APPLIED, f'{prefix}{m["name"]}_{stamp}.png')
-        paint(layers, m['mm'], size, base=backdrop(layers, m['mm'], size, fill)).convert('RGB').save(
-            path, compress_level=1)
+        path = os.path.join(APPLIED, f'{prefix}{m["name"]}_{stamp}.{"jpg" if jpeg else "png"}')
+        img = paint(layers, m['mm'], size, base=backdrop(layers, m['mm'], size, fill)).convert('RGB')
+        img.save(path, quality=95) if jpeg else img.save(path, compress_level=1)
         files[m['id']] = path
     return files
 
@@ -1084,6 +1329,7 @@ class Popup:
 class App:
     def __init__(self, root):
         self.root = root
+        move_old_data()
         cfg = json.load(open(CONFIG, encoding='utf-8')) if os.path.exists(CONFIG) else {}
         self.mons = detect_monitors()
         self.sig = signature(self.mons)
@@ -1118,18 +1364,25 @@ class App:
         self.auto_update = tk.BooleanVar(value=saved.get('updates', True))
         self.lock = tk.BooleanVar(value=saved.get('lock', False))
         self.fetching = set()  # daily wallpapers whose picture is being downloaded
+        self.loupe = tk.BooleanVar(value=False)
+        self.loupe_photo = self.mouse_mm = None
+        self.rendered = {}  # wallpaper id: (what it looked like, its files), so switching back is instant
+        self.desktop = virtual_desktops()[1]
+        self.drift_job = self.drift_busy = None
         self.context = self.context_return = None  # wallpaper forced by a rule, and the one to go back to
         self.adj_vars = {key: tk.DoubleVar(value=0) for key, _, _ in ADJUSTMENTS}
         self.adj_vars['angle'] = tk.DoubleVar(value=0)
         self.redraw_job = self.settle_job = self.frame_key = self.photo = None
         self.fast = False
-        self.update_waiting = self.update_job = None
+        self.update_waiting = self.update_job = self.staged = None
         self.apply_note = ''
         saved = cfg.get('grid', {})
         self.grid_step = tk.StringVar(value=str(saved.get('step', 10)))
         self.grid_snap = tk.BooleanVar(value=saved.get('snap', False))
         self.fill_label = tk.StringVar(value=FILLS[0])
         self.autostart = tk.BooleanVar(value=self.autostart_cmd() is not None)
+        if self.autostart.get() and self.autostart_cmd() != self.autostart_line():
+            self.set_autostart()  # the exe moved (or the data did): start the one that is running now
         self.tray_ok = self.balloon_shown = False
         os.makedirs(THUMBS, exist_ok=True)
         self.hint = ('Wheel: zoom view  ·  Ctrl+wheel: zoom image (+Shift: fine)  ·  Drag image: move  ·  '
@@ -1151,6 +1404,8 @@ class App:
         self.schedule()
         root.after(2000, self.scan_watched)
         root.after(3000, self.check_context)
+        root.after(1000, self.watch_desktop)
+        self.drift_job = root.after(DRIFT_STEP * 1000, self.drift_tick)
         if FROZEN:
             try:
                 os.remove(sys.executable + '.old')  # the copy an update set aside last time
@@ -1287,6 +1542,11 @@ class App:
         ttk.Label(opts, text='Grid', style='Bar.TLabel').pack(side='left')
         ttk.Spinbox(opts, from_=1, to=500, increment=5, width=5, textvariable=self.grid_step).pack(side='left', padx=6)
         ttk.Label(opts, text='mm', style='Bar.TLabel').pack(side='left')
+        lp = ttk.Checkbutton(opts, text='Seam loupe', variable=self.loupe, style='Bar.TCheckbutton',
+                             command=self.redraw)
+        lp.pack(side='left', padx=(14, 0))
+        self.tip(lp, 'A magnifier at the seam nearest the pointer: both monitors\' real pixels side by side, the '
+                     'bezel gap closed, so you can see whether a line meets')
         ttk.Checkbutton(opts, text='Snap to grid', variable=self.grid_snap, style='Bar.TCheckbutton').pack(
             side='left', padx=(14, 28))
         ttk.Label(opts, text='Behind images', style='Bar.TLabel').pack(side='left')
@@ -1298,7 +1558,7 @@ class App:
         adj.pack(side='left', padx=(28, 0))
         for key, name, limit in (('angle', 'Angle', 180), *((k, n, 100) for k, n, _ in ADJUSTMENTS)):
             ttk.Label(adj, text=name, style='Bar.TLabel').pack(side='left', padx=(10, 4))
-            sc = ttk.Scale(adj, from_=-limit, to=limit, length=110, variable=self.adj_vars[key],
+            sc = ttk.Scale(adj, from_=-limit, to=limit, length=90, variable=self.adj_vars[key],
                            command=lambda v, k=key: self.set_adj(k, v))
             sc.pack(side='left')
             sc.bind('<ButtonRelease-1>', lambda e: (self.settle(), self.store()), add='+')
@@ -1488,9 +1748,9 @@ class App:
                 self.update_job = self.root.after(300, done)
                 return
             self.update_job = None
-            waiting, failed = result[0]
+            waiting, failed, staged = result[0]
             if waiting:
-                self.update_waiting = waiting
+                self.update_waiting, self.staged = waiting, staged
                 self.status['text'] = f'Updated to {waiting}: it opens at the next start (tray menu › Restart to update).'
                 if self.tray_ok:
                     self.tray_balloon(f'Spanwyse {waiting} is downloaded. Restart it from this icon\'s menu, '
@@ -1501,14 +1761,26 @@ class App:
         self.update_job = self.root.after(300, done)
 
     def restart(self):
-        """Start the updated exe (it already sits under this one's name) and close this one."""
+        """Start the updated exe (it already sits under this one's name, or is put there now with an
+        administrator prompt) and close this one."""
+        if self.staged:
+            self.status['text'] = 'Installing the update: Windows asks for permission to write in its folder…'
+            self.root.update_idletasks()
+            if not install_staged(sys.executable, self.staged):
+                self.status['text'] = (f'Spanwyse {self.update_waiting} wasn\'t installed: it needs permission to '
+                                       'write in its folder. Try again from the tray menu.')
+                return
+            self.staged = None
         self.store()
         subprocess.Popen([sys.executable] + [a for a in sys.argv[1:] if a == '--tray'])
         self.quit()
 
     def hotkeys(self):
-        failed = [name for hid, vk, name in ((1, 0x27, '→'), (2, 0x25, '←'))
-                  if not user32.RegisterHotKey(self.hwnd, hid, 0x1 | 0x2 | 0x4000, vk)]  # Alt|Ctrl|NoRepeat
+        held = [(hid, name, combo, does, bool(user32.RegisterHotKey(self.hwnd, hid, 0x1 | 0x2 | 0x4000, vk)))
+                for hid, vk, name, combo, does in ((1, 0x27, '→', 'Ctrl+Alt+Right', 'Next wallpaper'),
+                                                   (2, 0x25, '←', 'Ctrl+Alt+Left', 'Previous wallpaper'))]
+        write_card([(combo, does, ok) for _, _, combo, does, ok in held])
+        failed = [name for _, name, _, _, ok in held if not ok]
         if failed:
             self.status['text'] = f'Ctrl+Alt+{"/".join(failed)} is taken by another app; those hotkeys are off.'
 
@@ -1518,18 +1790,19 @@ class App:
         except OSError:
             return None
 
+    def autostart_line(self):
+        if FROZEN:
+            return f'"{sys.executable}" --tray'
+        pyw = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')  # pythonw: no console window
+        return f'"{pyw if os.path.exists(pyw) else sys.executable}" "{os.path.abspath(__file__)}" --tray'
+
     def set_autostart(self):
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE)
         if not self.autostart.get():
             if self.autostart_cmd() is not None:
                 winreg.DeleteValue(key, 'Spanwyse')
             return
-        if FROZEN:
-            cmd = f'"{sys.executable}" --tray'
-        else:  # pythonw: no console window
-            pyw = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
-            cmd = f'"{pyw if os.path.exists(pyw) else sys.executable}" "{os.path.abspath(__file__)}" --tray'
-        winreg.SetValueEx(key, 'Spanwyse', 0, winreg.REG_SZ, cmd)
+        winreg.SetValueEx(key, 'Spanwyse', 0, winreg.REG_SZ, self.autostart_line())
 
     def show(self):
         self.root.deiconify()
@@ -1770,7 +2043,9 @@ class App:
         notes = [n for n in (f'new every day from {p["daily"].title()}' if p.get('daily') else '',
                              '▶ slideshow' if p.get('show') else '', f'from {p["time"]}' if p.get('time') else '',
                              f'while {rule["app"]} runs' if rule.get('app') else '',
-                             f'in {rule["theme"]} mode' if rule.get('theme') else '') if n]
+                             f'in {rule["theme"]} mode' if rule.get('theme') else '',
+                             f'on {rule["name"]}' if rule.get('desktop') else '',
+                             'drifts' if p.get('drift') else '') if n]
         return '   ' + p['name'] + ('\n   ' + '  ·  '.join(notes) if notes else '')
 
     def add_item(self, p):
@@ -1847,6 +2122,9 @@ class App:
             m.add_command(label='Add to slideshow' + many, command=lambda: self.mark_slideshow(chosen, True))
         m.add_command(label='Start time for “Time of day”…', command=self.set_time)
         m.add_command(label='Show when an app runs / dark mode…', command=self.set_rule)
+        m.add_command(label='Show on a virtual desktop…', command=lambda: self.desktop_menu(e))
+        m.add_command(label=('Stop the slow drift' if self.cur.get('drift') else 'Slow drift (pan and zoom)'),
+                      command=self.toggle_drift)
         m.add_separator()
         m.add_command(label='Rename…\tF2', command=self.rename)
         m.add_command(label='Delete\tDel', command=self.delete)
@@ -1884,10 +2162,10 @@ class App:
         self.store()
         self.context = 'recheck'  # evaluate the new rule on the next check even if nothing else changed
 
-    def check_context(self):
+    def check_context(self, again=True):
         """Every few seconds: if a “show when” rule starts or stops holding, switch wallpapers (and, when it
         stops, go back to the one shown before). Only changes act, so a manual pick isn't overridden."""
-        i = context_match(self.presets, processes(), windows_dark())
+        i = context_match(self.presets, processes(), windows_dark(), self.desktop)
         key = self.presets[i]['id'] if i is not None else None
         if key != self.context:
             if key:
@@ -1900,7 +2178,93 @@ class App:
                 if back is not None and self.presets[back]['id'] != self.applied:
                     self.go(back)
             self.context = key
-        self.root.after(5000, self.check_context)
+        if again:
+            self.root.after(5000, self.check_context)
+
+    def watch_desktop(self):
+        """A few times a second: switching virtual desktops shouldn't wait for the five-second check."""
+        now = virtual_desktops()[1]
+        if now != self.desktop:
+            self.desktop = now
+            self.check_context(again=False)
+        self.root.after(300, self.watch_desktop)
+
+    def desktop_menu(self, e):
+        desks = virtual_desktops()[0]
+        if len(desks) < 2:
+            self.status['text'] = 'Only one virtual desktop: add one with Win+Ctrl+D, then pick it here.'
+            return
+        p, m = self.cur, self.menu()
+        for g, name in desks:
+            m.add_command(label=('● ' if (p.get('when') or {}).get('desktop') == g else '    ') + name,
+                          command=lambda g=g, name=name: self.set_desktop(p, {'desktop': g, 'name': name}))
+        if (p.get('when') or {}).get('desktop'):
+            m.add_separator()
+            m.add_command(label='Not tied to a desktop', command=lambda: self.set_desktop(p, None))
+        m.tk_popup(e.x_root, e.y_root)
+
+    def set_desktop(self, p, rule):
+        """A wallpaper shown while that desktop is on screen (it replaces the wallpaper's other rule)."""
+        if rule:
+            p['when'] = rule
+        else:
+            p.pop('when', None)
+        self.tree.item(p['id'], text=self.label(p))
+        self.store()
+        self.context = 'recheck'
+
+    def toggle_drift(self):
+        p = self.cur
+        if p.get('drift'):
+            p.pop('drift')
+        else:
+            p['drift'] = True
+        self.tree.item(p['id'], text=self.label(p))
+        self.store()
+        if p['id'] == self.applied:
+            self.root.after_cancel(self.drift_job)
+            self.drift_job = self.root.after(1000 if p.get('drift') else DRIFT_STEP * 1000, self.drift_tick)
+            if not p.get('drift'):
+                self.apply_preset_quietly(p, drift_at=None)
+
+    def drift_tick(self):
+        """Every few minutes, the next frame of the applied wallpaper's drift, rendered in a thread and set
+        without a fade (the step is a few pixels)."""
+        self.drift_job = self.root.after(DRIFT_STEP * 1000, self.drift_tick)
+        p = next((p for p in self.presets if p['id'] == self.applied), None)
+        if p and p.get('drift') and not self.drift_busy:
+            self.apply_preset_quietly(p, drift_at=time.time())
+
+    def apply_preset_quietly(self, p, drift_at):
+        layers = self.layers if p is self.cur else [load_layer(L['path'], L['place'], L.get('xf', (0, False)),
+                                                               L.get('crop'), L.get('adj'), L.get('angle', 0))
+                                                    for L in p['layers'] if os.path.exists(L['path'])]
+        if not layers:
+            return
+        shown = drift(layers, self.mons, drift_at) if drift_at is not None else layers
+        mons, fill, result = [dict(m) for m in self.mons], p.get('fill', '#000000'), []
+        self.drift_busy = True
+
+        def work():
+            result.append(write_monitor_images(shown, mons, fill, 'drift_', jpeg=True))
+
+        def done():
+            if not result:
+                return self.root.after(200, done)
+            self.drift_busy = False
+            if p['id'] != self.applied:  # another wallpaper was applied meanwhile
+                return
+            try:
+                DesktopWallpaper().show(result[0])
+            except OSError:
+                return
+            clean_applied(self.keep_files(result[0]))
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(200, done)
+
+    def keep_files(self, files):
+        """Generated images to keep: the ones on screen and the ones kept for switching back."""
+        return [*files.values(), *(f for _, fs in self.rendered.values() for f in fs.values())]
 
     def set_time(self):
         if not self.cur:
@@ -2029,7 +2393,18 @@ class App:
         note = ''
         if self.stop_we.get() and stop_wallpaper_engine(processes()):
             note = '  (Wallpaper Engine stopped)'
-        files = write_monitor_images(self.layers, self.mons, self.fill(), prefix)
+        look = json.dumps([[[L['path'], L['place'], L['xf'], L['crop'], L['angle'], L['adj']] for L in self.layers],
+                           self.fill(), [m['mm'] for m in self.mons], self.sig])
+        old = self.rendered.get(self.cur['id']) if not prefix else None
+        if old and old[0] == look and all(os.path.exists(f) for f in old[1].values()):
+            files = old[1]
+        else:
+            files = write_monitor_images(self.layers, self.mons, self.fill(), prefix)
+            if not prefix:
+                self.rendered.pop(self.cur['id'], None)
+                self.rendered[self.cur['id']] = (look, files)
+                while len(self.rendered) > 6:  # a few wallpapers' worth, about 30 MB each
+                    self.rendered.pop(next(iter(self.rendered)))
         cover = []
         try:
             desk = DesktopWallpaper()
@@ -2053,8 +2428,11 @@ class App:
         files = files or self.show_on_monitors()
         if not files:
             return
-        clean_applied(files.values())
+        clean_applied(self.keep_files(files))
         self.applied = self.cur['id']
+        if self.cur.get('drift'):  # start drifting from here, not at the old timer's next tick
+            self.root.after_cancel(self.drift_job)
+            self.drift_job = self.root.after(DRIFT_STEP * 1000, self.drift_tick)
         self.store()
         self.status['text'] = f'Applied “{self.cur["name"]}”' + self.apply_note
         main = next((m for m in self.mons if m['px'][:2] == [0, 0]), self.mons[0])
@@ -2367,6 +2745,9 @@ class App:
             return next((i for i, (x, y) in enumerate(self.corners()) if abs(x - e.x) <= 8 and abs(y - e.y) <= 8), None)
 
     def hover_cursor(self, e):
+        self.mouse_mm = self.to_mm(e)
+        if self.loupe.get():
+            self.redraw()
         i = self.handle_at(e)
         self.canvas.config(cursor='' if i is None else ('size_nw_se', 'size_ne_sw')[i in (1, 2)])
 
@@ -2394,6 +2775,7 @@ class App:
         self.start_drag(e, self.sel)
 
     def motion(self, e):
+        self.mouse_mm = self.to_mm(e)
         if self.pending and (self.resize or self.drag):
             self.checkpoint(self.pending)
             self.pending = None
@@ -2594,6 +2976,17 @@ class App:
         if self.active:  # resize handles, above the monitor outlines
             for x, y in self.corners():
                 c.create_rectangle(x - 5, y - 5, x + 5, y + 5, fill='white', outline=INK, width=2)
+        if self.loupe.get():
+            u = union([m['mm'] for m in self.mons])
+            got = seam_loupe(self.layers, self.mons, self.fill(), self.mouse_mm or (u[0] + u[2] / 2, u[1] + u[3] / 2))
+            if got:
+                img, (m1, m2) = got
+                x, y = size[0] - img.width - 16, size[1] - img.height - 16
+                c.create_rectangle(x - 9, y - 30, x + img.width + 8, y + img.height + 8, fill=INK, outline=BORDER)
+                c.create_text(x, y - 15, anchor='w', fill=MUTED, font=(FONT, 9),
+                              text=f'Seam {m1["name"]} | {m2["name"]}  ·  real pixels, gap closed')
+                self.loupe_photo = ImageTk.PhotoImage(img)
+                c.create_image(x, y, anchor='nw', image=self.loupe_photo)
         c.addtag_all('ov')  # everything drawn above is an overlay, deleted at the next frame...
         c.dtag('pic', 'ov')  # ...except the picture itself
 
@@ -2690,6 +3083,28 @@ def selftest():
     assert flat['place'] == [0, -385, 1.07]  # nothing to prefer: centred
     # Sharpness: screen pixels per image pixel on each monitor.
     assert round(softness([line], mons[0]), 2) == round(3840 / 697 * 0.5, 2) and softness([red], mons[0]) == 0
+    # Virtual desktops: their rule sits between running apps and the theme.
+    vd = [dict(when={'theme': 'dark'}), dict(when={'desktop': 'g2', 'name': 'Desktop 2'}), dict(when={'app': 'Game.exe'})]
+    assert [context_match(vd, {}, True, 'g2'), context_match(vd, {}, True, 'g1'), context_match(vd, {'game.exe': 1}, True, 'g2')] == [1, 0, 2]
+    # Drift: still at t=0, moving later, and never baring an edge of a monitor (here, one image over both).
+    wide_img = dict(orig=Image.new('RGB', (2400, 1400)), place=None)
+    set_xf(wide_img, (0, False))
+    auto_fit(wide_img, mons)
+    assert drift([wide_img], mons, 0)[0]['place'] == wide_img['place']
+    places = []
+    for t in range(0, DRIFT_PERIOD, DRIFT_STEP):
+        x, y, rw, rh = layer_rect(drift([wide_img], mons, t)[0])
+        assert all(x <= m['mm'][0] + 1e-6 and y <= m['mm'][1] + 1e-6 and x + rw >= m['mm'][0] + m['mm'][2] - 1e-6
+                   and y + rh >= m['mm'][1] + m['mm'][3] - 1e-6 for m in mons), t
+        places.append((round(x, 1), round(y, 1), round(rw)))
+    assert len(set(places)) > 10
+    # Loupe: the line at 250 mm meets at the seam (same height on both sides, within a pixel of either monitor).
+    named = [dict(m, name=f'M{i}') for i, m in enumerate(mons)]
+    img, pair = seam_loupe([line], named, '#000000', (697, 250))
+    assert pair == (named[0], named[1])
+    rows = [[r for r in range(img.height) if img.convert('L').getpixel((x, r)) < 128] for x in (img.width // 2 - 20, img.width // 2 + 20)]
+    assert rows[0] and rows[1] and abs(sum(rows[0]) / len(rows[0]) - sum(rows[1]) / len(rows[1])) < 4, rows
+    assert seam_loupe([line], named[:1], '#000000', (100, 100)) is None
     print('ok')
 
 

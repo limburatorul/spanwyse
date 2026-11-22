@@ -14,13 +14,16 @@ monitor exactly what sits physically in front of it.
 Free, MIT, Windows 10 and 11. No account and no telemetry. Over the network it only checks GitHub for a
 newer version, at start and every six hours (a new version is verified against the SHA-256 GitHub
 publishes and installed in place; untick *Check for updates automatically* to stop it), and, if you add
-a picture-of-the-day wallpaper, downloads that picture from Bing or Wallhaven once a day.
+a picture-of-the-day wallpaper, downloads that picture from Bing, Wallhaven or Wikimedia Commons once a day.
 
 ## Starting it
 
 Download **`Spanwyse.exe`** from the [latest release](https://github.com/limburatorul/spanwyse/releases/latest)
-and run it. One file, no installer, no administrator rights. It keeps its settings next to itself
-(`spanwyse.json`, `thumbs\`, `applied\`), so put it in a folder of its own.
+and run it. One file, no installer, no administrator rights. Its settings and the images it generates live
+in `%APPDATA%\ProtagonistLabs\Spanwyse`, beside the other Protagonist Labs apps' (versions before 1.2 kept
+them next to the exe; 1.2 moves them there by itself), so the exe can sit anywhere. In a folder only
+administrators can write in, such as Program Files, an update asks for permission once, when you restart
+into it.
 
 It isn't code-signed yet, so SmartScreen may warn the first time: **More info**, then **Run anyway**.
 
@@ -39,8 +42,12 @@ It isn't code-signed yet, so SmartScreen may warn the first time: **More info**,
 - **Painting your own.** *Export › Template to paint on* saves a PNG of your layout at the sharpest
   monitor's density, monitors outlined and labelled. Paint over it at that size and place the result
   with no monitor selected: it lands exactly where you painted it.
+- **Seam loupe.** A magnifier at the seam nearest the pointer shows both monitors' real pixels side by
+  side, the bezel gap closed, so you can see whether a line meets without looking from one screen to the
+  other.
 - **Picture of the day.** The cloud button in the image list adds a wallpaper that gets Bing's image
-  of the day or Wallhaven's top picture of the day, fitted across all monitors and renewed daily.
+  of the day, Wallhaven's top picture of the day or Wikimedia Commons' picture of the day (with its
+  author and licence), fitted across all monitors and renewed daily.
 - **Split at seam.** A single large image across two monitors that still don't line up can be cut
   where they meet (side by side or stacked); each piece then moves and resizes on its own.
 - **Arranging.** Zoom the view with the wheel, the selected image with Ctrl+wheel. Corners resize.
@@ -55,8 +62,9 @@ It isn't code-signed yet, so SmartScreen may warn the first time: **More info**,
   for 15 seconds and puts the old one back unless you keep it.
 - **Wallpapers and slideshow.** Every arrangement is saved as a wallpaper with a thumbnail. Mark the
   ones you want for the slideshow and pick in order, random or by time of day, every N seconds,
-  minutes or hours. A wallpaper can also be shown while an app runs (by its exe name) or when
-  Windows is in dark or light mode.
+  minutes or hours. A wallpaper can also be shown while an app runs (by its exe name), while a given
+  virtual desktop is on screen, or when Windows is in dark or light mode. Any wallpaper can drift: a slow
+  pan and zoom of a few pixels every three minutes, never baring an edge.
 - **Out of the way.** Closing the window keeps Spanwyse in the notification area; Ctrl+Alt+← and →
   switch wallpapers from anywhere, and it can start with Windows. If Wallpaper Engine is running it
   is stopped when you apply, so it doesn't paint over the result (you can turn that off).
@@ -86,8 +94,8 @@ python spanwyse.py --test
 
 `--test` checks the alignment math: that a line lands at the same physical height on monitors of
 different densities, that split pieces put back together match the whole image exactly, flips and
-rotations, the time-of-day choice, the "show when" rules, the template, auto-fit and the sharpness
-warning.
+rotations, the time-of-day choice, the "show when" rules, the template, auto-fit, the sharpness
+warning, the drift, the seam loupe and the virtual desktop rules.
 
 To build the exe, also `pip install pyinstaller`, then run `build.cmd`.
 
