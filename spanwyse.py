@@ -12,6 +12,7 @@ in Windows' "Span" mode.
 """
 import ctypes
 import ctypes.wintypes as w
+import functools
 import hashlib
 import json
 import math
@@ -27,6 +28,7 @@ from tkinter import colorchooser, filedialog, messagebox, ttk
 from tkinter import font as tkfont
 
 import subprocess
+import threading
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps, ImageTk
 
@@ -150,23 +152,99 @@ def box(r, view):
 ROT = {1: Image.ROTATE_270, 2: Image.ROTATE_180, 3: Image.ROTATE_90}  # quarter turns clockwise
 
 
+_OPENED = {}  # (path, modified time): decoded image; an 8K JPEG takes ~0.3 s to decode, and pairs often reuse one
+
+
+def open_image(path):
+    key = (path, os.path.getmtime(path))
+    im = _OPENED.pop(key, None)
+    if im is None:
+        im = Image.open(path)
+        im.load()
+        if im.mode not in ('RGB', 'RGBA'):  # palette, greyscale, CMYK...: keep transparency if there is any
+            im = im.convert('RGBA' if 'A' in im.getbands() or 'transparency' in im.info else 'RGB')
+    _OPENED[key] = im
+    while len(_OPENED) > 4:
+        _OPENED.pop(next(iter(_OPENED)))
+    return im
+
+
+def rotated_size(w, h, deg):
+    """The size Pillow's rotate(-deg, expand=True) gives (same arithmetic), without rotating anything."""
+    a = -math.radians(-deg % 360.0)
+    m = [round(math.cos(a), 15), round(math.sin(a), 15), 0.0, round(-math.sin(a), 15), round(math.cos(a), 15), 0.0]
+
+    def tf(x, y):
+        return m[0] * x + m[1] * y + m[2], m[3] * x + m[4] * y + m[5]
+
+    m[2], m[5] = tf(-w / 2.0, -h / 2.0)
+    m[2] += w / 2.0
+    m[5] += h / 2.0
+    xs, ys = zip(*(tf(x, y) for x, y in ((0, 0), (w, 0), (w, h), (0, h))))
+    return math.ceil(max(xs)) - math.floor(min(xs)), math.ceil(max(ys)) - math.floor(min(ys))
+
+
 def set_xf(L, xf, crop=None, angle=None):
-    """Rebuild the layer's source: original -> flip/quarter turns (xf) -> crop -> free rotation in degrees
-    (clockwise, transparent corners; None keeps the current angle)."""
+    """The layer's pixels: original -> flip/quarter turns (xf) -> crop (the `base`), then a free rotation in
+    degrees (clockwise, transparent corners; None keeps the current angle). The base and its preview are
+    rebuilt only when xf or crop change."""
     rot, flip = xf
-    angle = L.get('angle', 0) if angle is None else angle
-    img = L['orig'].transpose(Image.FLIP_LEFT_RIGHT) if flip else L['orig']
-    img = img.transpose(ROT[rot]) if rot else img
-    L['xf'], L['crop'], L['full'], L['angle'] = [rot, flip], crop and list(crop), img.size, angle
-    img = img.crop(crop) if crop else img
-    L['src'] = img.rotate(-angle, Image.BICUBIC, expand=True) if angle else img
-    L['preview'] = L['src'].copy()
-    L['preview'].thumbnail((1600, 1600))
-    L['pratio'] = L['src'].width / L['preview'].width
+    crop = crop and list(crop)
+    if 'base' not in L or L['xf'] != [rot, flip] or L['crop'] != crop:
+        img = L['orig'].transpose(Image.FLIP_LEFT_RIGHT) if flip else L['orig']
+        img = img.transpose(ROT[rot]) if rot else img
+        L['xf'], L['crop'], L['full'] = [rot, flip], crop, img.size
+        L['base'] = img.crop(crop) if crop else img
+        L['base_preview'] = L['base'].copy()
+        L['base_preview'].thumbnail((1600, 1600))
+    set_rotation(L, L.get('angle', 0) if angle is None else angle)
+
+
+def set_rotation(L, angle, fast=False):
+    """Only the 1600 px preview is rotated here; source() rotates the full image when it is actually drawn
+    at full size, since an 8K rotation takes seconds. `fast` (while a slider is dragged) turns the preview
+    with the nearest pixel, 5 ms instead of 100; it is redone smoothly when the drag settles."""
+    L['angle'] = angle
+    L.pop('rotated', None)
+    L.pop('rotating', None)
+    L['size'] = rotated_size(*L['base'].size, angle) if angle else L['base'].size
+    bp = L['base_preview']
+    L['rough'] = bool(angle and fast)
+    L['preview'] = (bp.convert('RGBA').rotate(-angle, Image.NEAREST if fast else Image.BICUBIC, expand=True)
+                    if angle else bp)
+    L['pratio'] = L['size'][0] / L['preview'].width
+
+
+def source(L):
+    """The layer's full-resolution pixels, rotated on first use and kept until the angle changes."""
+    if not L['angle']:
+        return L['base']
+    if L.get('rotated', (None,))[0] != L['angle']:
+        L['rotated'] = (L['angle'], L['base'].convert('RGBA').rotate(-L['angle'], Image.BICUBIC, expand=True))
+    return L['rotated'][1]
+
+
+def source_soon(L):
+    """For the editor: the full-resolution pixels if they are ready, else None while a thread rotates them
+    (Pillow lets go of the GIL while it works, so the window stays responsive meanwhile)."""
+    if not L['angle']:
+        return L['base']
+    angle = L['angle']
+    if L.get('rotated', (None,))[0] == angle:
+        return L['rotated'][1]
+    if L.get('rotating') != angle:
+        L['rotating'] = angle
+
+        def work(base=L['base']):
+            img = base.convert('RGBA').rotate(-angle, Image.BICUBIC, expand=True)
+            if L['angle'] == angle and L['base'] is base:  # still wanted
+                L['rotated'] = (angle, img)
+        threading.Thread(target=work, daemon=True).start()
+    return None
 
 
 def load_layer(path, place=None, xf=(0, False), crop=None, adj=None, angle=0):
-    L = dict(path=path, place=place, orig=Image.open(path).convert('RGBA'), adj=dict(adj or {}))
+    L = dict(path=path, place=place, orig=open_image(path), adj=dict(adj or {}))
     set_xf(L, xf, crop, angle)
     return L
 
@@ -184,7 +262,7 @@ def turn(L, op):
     x, y, rw, rh = layer_rect(L)
     set_xf(L, xf, crop)
     s = L['place'][2]
-    L['place'] = [x + rw / 2 - L['src'].width * s / 2, y + rh / 2 - L['src'].height * s / 2, s]
+    L['place'] = [x + rw / 2 - L['size'][0] * s / 2, y + rh / 2 - L['size'][1] * s / 2, s]
 
 
 def seams(mons, a):
@@ -200,12 +278,12 @@ def seams(mons, a):
     return out
 
 
-def set_angle(L, angle):
+def set_angle(L, angle, fast=False):
     """Free rotation around the image's centre, keeping its scale."""
     x, y, rw, rh = layer_rect(L)
-    set_xf(L, L['xf'], L['crop'], angle)
+    set_rotation(L, angle, fast)
     s = L['place'][2]
-    L['place'] = [x + rw / 2 - L['src'].width * s / 2, y + rh / 2 - L['src'].height * s / 2, s]
+    L['place'] = [x + rw / 2 - L['size'][0] * s / 2, y + rh / 2 - L['size'][1] * s / 2, s]
 
 
 def split(L, mons):
@@ -214,7 +292,7 @@ def split(L, mons):
     if L.get('angle'):
         return [L]
     x, y, s = L['place']
-    w_, h_ = L['src'].size
+    w_, h_ = L['size']
     cols = sorted({0, w_, *(round((c - x) / s) for c in seams(mons, 0) if 0 < (c - x) / s < w_)})
     rows = sorted({0, h_, *(round((c - y) / s) for c in seams(mons, 1) if 0 < (c - y) / s < h_)})
     if len(cols) + len(rows) < 5:
@@ -231,32 +309,37 @@ def split(L, mons):
 
 def layer_rect(L):
     x, y, s = L['place']
-    return x, y, L['src'].width * s, L['src'].height * s
+    return x, y, L['size'][0] * s, L['size'][1] * s
 
 
 def cover(L, rect):
     """Scale and centre the image so it fully covers `rect`."""
     x, y, rw, rh = rect
-    iw, ih = L['src'].size
+    iw, ih = L['size']
     s = max(rw / iw, rh / ih)
     L['place'] = [x + (rw - iw * s) / 2, y + (rh - ih * s) / 2, s]
 
 
 def render(src, place, rect, size, resample):
-    """The part of `src` that falls on `rect`, at `size` pixels; transparent outside the image.
-    Only the visible part is resampled, so the cost doesn't grow when rect is much larger."""
+    """The part of `src` that falls on `rect` (drawn at `size` pixels), as (image, (x, y) to paste it at),
+    or None if none of it does. Only the visible part is resampled and returned, so the cost follows what
+    is on screen, not the size of the source or of the canvas."""
     ix, iy, s = place
     x, y, rw, rh = rect
     kx, ky = size[0] / rw, size[1] / rh  # output pixels per mm
     c = (max((x - ix) / s, 0), max((y - iy) / s, 0),
          min((x + rw - ix) / s, src.width), min((y + rh - iy) / s, src.height))  # in source pixels
-    out = Image.new('RGBA', size)
     if c[0] >= c[2] or c[1] >= c[3]:
-        return out
+        return None
     d = [round((c[0] * s + ix - x) * kx), round((c[1] * s + iy - y) * ky),
          round((c[2] * s + ix - x) * kx), round((c[3] * s + iy - y) * ky)]
-    out.paste(src.resize((max(d[2] - d[0], 1), max(d[3] - d[1], 1)), resample, box=c), d[:2])
-    return out
+    # Crop to whole pixels around the box first (cheap), then resample with the sub-pixel box inside that:
+    # same result, without the resampler walking a whole 8K source when only a corner is on screen.
+    x0, y0 = max(math.floor(c[0]) - 2, 0), max(math.floor(c[1]) - 2, 0)
+    part = src.crop((x0, y0, min(math.ceil(c[2]) + 2, src.width), min(math.ceil(c[3]) + 2, src.height)))
+    d[0], d[1] = max(d[0], 0), max(d[1], 0)
+    return part.resize((max(min(d[2], size[0]) - d[0], 1), max(min(d[3], size[1]) - d[1], 1)), resample,
+                       box=(c[0] - x0, c[1] - y0, c[2] - x0, c[3] - y0)), (d[0], d[1])
 
 
 ADJUSTMENTS = (('brightness', 'Brightness', ImageEnhance.Brightness), ('contrast', 'Contrast', ImageEnhance.Contrast),
@@ -268,35 +351,76 @@ def adjust(img, adj):
     Applied to the already-resampled output, so it costs the same at any zoom."""
     if not adj or not any(adj.values()):
         return img
-    rgb = img.convert('RGB')
+    rgb = img.convert('RGB') if img.mode != 'RGB' else img
     for key, _, enhancer in ADJUSTMENTS:
         if adj.get(key):
             rgb = enhancer(rgb).enhance(1 + adj[key] / 100)
-    rgb.putalpha(img.getchannel('A'))
+    if img.mode == 'RGBA':
+        rgb.putalpha(img.getchannel('A'))
     return rgb
 
 
-def paint(layers, rect, size, preview=False, base=None):
-    """All the wallpaper's images (last on top) over the physical `rect`, on `base` (default black)."""
+def paint(layers, rect, size, preview=False, base=None, fast=False):
+    """All the wallpaper's images (last on top) over the physical `rect`, on `base` (default black).
+    `fast` resamples with the nearest pixel (about 6x quicker) for frames drawn while something moves."""
     out = base.copy() if base else Image.new('RGBA', size, (0, 0, 0, 255))
+    quick = Image.NEAREST if fast else Image.BILINEAR
     for L in layers:
         x, y, s = L['place']
         if preview and size[0] / rect[2] * s * L['pratio'] <= 1:  # preview is sharp enough; at high zoom use source
-            part = render(L['preview'], (x, y, s * L['pratio']), rect, size, Image.BILINEAR)
+            part = render(L['preview'], (x, y, s * L['pratio']), rect, size, quick)
         else:
-            part = render(L['src'], (x, y, s), rect, size, Image.BILINEAR if preview else Image.LANCZOS)
-        out.alpha_composite(adjust(part, L.get('adj')))
+            part = render(source(L), (x, y, s), rect, size, quick if preview else Image.LANCZOS)
+        if part:
+            img, at = part
+            img = adjust(img, L.get('adj'))
+            if img.mode == 'RGBA':  # tilted or transparent: blend
+                out.alpha_composite(img, at)
+            else:  # opaque: a plain copy, much cheaper than blending
+                out.paste(img, at)
     return out
 
 
-def backdrop(layers, rect, size, fill):
-    """What shows on a monitor where no image covers it: a colour, or the bottom image blurred to fill it."""
+def paint_editor(layers, rect, size, fast=False):
+    """The images over `rect` as an RGB picture plus a mask of where they are: the editor's cheap form
+    (plain copies instead of blending whole canvases). Full-resolution pixels are used only when zoomed past
+    the preview, never while something moves, and a tilted one only once its rotation is ready."""
+    rgb, mask = Image.new('RGB', size), Image.new('L', size, 0)
+    quick = Image.NEAREST if fast else Image.BILINEAR
+    for L in layers:
+        x, y, s = L['place']
+        src = source_soon(L) if not fast and size[0] / rect[2] * s * L['pratio'] > 1 else None
+        if src is not None:
+            part = render(src, (x, y, s), rect, size, quick)
+        else:
+            part = render(L['preview'], (x, y, s * L['pratio']), rect, size, quick)
+        if not part:
+            continue
+        img, at = part
+        img = adjust(img, L.get('adj'))
+        where = (at[0], at[1], at[0] + img.width, at[1] + img.height)
+        if img.mode == 'RGBA':  # tilted or transparent: only where it has pixels
+            alpha = img.getchannel('A')
+            rgb.paste(img.convert('RGB'), at, alpha)
+            mask.paste(255, where, alpha)
+        else:
+            rgb.paste(img, at)
+            mask.paste(255, where)
+    return rgb, mask
+
+
+def backdrop(layers, rect, size, fill, part_of=None):
+    """What shows on a monitor where no image covers it: a colour, or the bottom image blurred to fill it.
+    `rect` is the area drawn at `size`; `part_of` the whole monitor when only part of it is on screen."""
     if fill == 'blur' and layers:
         L = dict(layers[0])
-        cover(L, rect)
+        cover(L, part_of or rect)
         x, y, s = L['place']
         small = (max(size[0] // 16, 1), max(size[1] // 16, 1))
-        img = render(L['preview'], (x, y, s * L['pratio']), rect, small, Image.BILINEAR)
+        img = Image.new('RGBA', small, (0, 0, 0, 255))
+        part = render(L['preview'], (x, y, s * L['pratio']), rect, small, Image.BILINEAR)
+        if part:
+            img.paste(*part)
         return img.filter(ImageFilter.GaussianBlur(4)).resize(size, Image.BILINEAR)
     return Image.new('RGBA', size, fill if fill.startswith('#') else '#000000')
 
@@ -312,8 +436,10 @@ def compose(layers, mons, fill='#000000'):
     return out
 
 
+@functools.lru_cache(maxsize=4)
 def graph_paper(view, size, step=10):
-    """Background grid in real millimetres: every `step` and every 10 steps, thinned out when zoomed far out."""
+    """Background grid in real millimetres: every `step` and every 10 steps, thinned out when zoomed far out.
+    Cached (moving an image doesn't move the grid); callers must not draw on the image it returns."""
     ox, oy, k = view
     img = Image.new('RGB', size, PAPER)
     d = ImageDraw.Draw(img)
@@ -328,23 +454,35 @@ def graph_paper(view, size, step=10):
     return img
 
 
-def preview_image(layers, mons, view, size, paper=True, step=10, fill='#000000'):
+def preview_image(layers, mons, view, size, paper=True, step=10, fill='#000000', fast=False):
     """Monitors show exactly what they'll display; image parts off-screen are ghosted over the grid."""
     ox, oy, k = view
-    img = (graph_paper(view, size, step) if paper else Image.new('RGB', size, PANEL)).convert('RGBA')
-    lay = paint(layers, (ox, oy, size[0] / k, size[1] / k), size, preview=True,
-                base=Image.new('RGBA', size, (0, 0, 0, 0))) if layers else None
-    if lay and paper:
-        ghost = lay.copy()
-        ghost.putalpha(lay.getchannel('A').point(lambda a: a * 40 // 100))
-        img.alpha_composite(ghost)
+    lay = paint_editor(layers, (ox, oy, size[0] / k, size[1] / k), size, fast) if layers else None
+    if not paper:
+        img = Image.new('RGB', size, PANEL)
+    elif lay:  # the images at 40 % over the grid, only where there are images (and only that box is blended)
+        grid = graph_paper(tuple(view), tuple(size), step)
+        img = grid.copy()
+        bb = lay[1].getbbox()
+        if bb:
+            img.paste(Image.blend(grid.crop(bb), lay[0].crop(bb), 0.4), bb[:2], lay[1].crop(bb))
+    else:
+        img = graph_paper(tuple(view), tuple(size), step).copy()
     for m in mons:
         b = box(m['mm'], view)
-        screen = backdrop(layers, m['mm'], (max(b[2] - b[0], 1), max(b[3] - b[1], 1)), fill)
+        # Only the part of the monitor that is on the canvas: zoomed in, a monitor can be 7000 px wide.
+        v = [max(b[0], 0), max(b[1], 0), min(b[2], size[0]), min(b[3], size[1])]
+        if v[0] >= v[2] or v[1] >= v[3]:
+            continue
+        if lay and lay[1].crop(v).getextrema() == (255, 255):  # fully covered: just the pixels, no backdrop
+            img.paste(lay[0].crop(v), v[:2])
+            continue
+        seen = (ox + v[0] / k, oy + v[1] / k, (v[2] - v[0]) / k, (v[3] - v[1]) / k)
+        screen = backdrop(layers, seen, (v[2] - v[0], v[3] - v[1]), fill, part_of=m['mm']).convert('RGB')
         if lay:
-            screen.alpha_composite(lay.crop(b))
-        img.paste(screen, b[:2])
-    return img.convert('RGB')
+            screen.paste(lay[0].crop(v), (0, 0), lay[1].crop(v))
+        img.paste(screen, v[:2])
+    return img
 
 
 class PROCESSENTRY32(ctypes.Structure):
@@ -791,7 +929,8 @@ class App:
         self.context = self.context_return = None  # wallpaper forced by a rule, and the one to go back to
         self.adj_vars = {key: tk.DoubleVar(value=0) for key, _, _ in ADJUSTMENTS}
         self.adj_vars['angle'] = tk.DoubleVar(value=0)
-        self.angle_job = None
+        self.redraw_job = self.settle_job = self.frame_key = self.photo = None
+        self.fast = False
         self.apply_note = ''
         saved = cfg.get('grid', {})
         self.grid_step = tk.StringVar(value=str(saved.get('step', 10)))
@@ -947,7 +1086,7 @@ class App:
             sc = ttk.Scale(adj, from_=-limit, to=limit, length=110, variable=self.adj_vars[key],
                            command=lambda v, k=key: self.set_adj(k, v))
             sc.pack(side='left')
-            sc.bind('<ButtonRelease-1>', lambda e: self.store(), add='+')
+            sc.bind('<ButtonRelease-1>', lambda e: (self.settle(), self.store()), add='+')
             sc.bind('<Double-Button-1>', lambda e, k=key: self.set_adj(k, 0))
         b = ttk.Button(adj, text='Reset', command=self.reset_adj)
         b.pack(side='left', padx=(10, 0))
@@ -1693,21 +1832,30 @@ class App:
         if not self.active:
             return self.adj_vars[key].set(0)
         self.checkpoint_burst()
-        if key == 'angle':  # rebuilding a 4K source per slider tick is slow: coalesce to the last value
-            if self.angle_job:
-                self.root.after_cancel(self.angle_job)
-            self.angle_job = self.root.after(60, self.apply_angle, round(float(value)))
-            return
-        self.active['adj'][key] = round(float(value))
-        self.adj_vars[key].set(self.active['adj'][key])
+        self.interact()
+        if key == 'angle':  # only the preview turns here; the full image waits until it's drawn full size
+            set_angle(self.active, round(float(value)), fast=True)
+        else:
+            self.active['adj'][key] = round(float(value))
         self.redraw()
 
-    def apply_angle(self, value):
-        self.angle_job = None
-        if self.active:
-            set_angle(self.active, value)
+    # --- smooth interaction: quick frames while something moves, full quality once it stops ---
+    def interact(self):
+        self.fast = True
+        if self.settle_job:
+            self.root.after_cancel(self.settle_job)
+        self.settle_job = self.root.after(250, self.settle)  # wheel ticks and slider drags have no "release"
+
+    def settle(self, _=None):
+        if self.settle_job:
+            self.root.after_cancel(self.settle_job)
+        self.settle_job = None
+        if self.fast:
+            self.fast = False
+            for L in self.layers:
+                if L.get('rough'):
+                    set_rotation(L, L['angle'])
             self.redraw()
-            self.store()
 
     def reset_adj(self):
         if self.active:
@@ -1885,9 +2033,11 @@ class App:
         if self.pending and (self.resize or self.drag):
             self.checkpoint(self.pending)
             self.pending = None
+        if self.resize or self.drag or self.pan:
+            self.interact()
         if self.resize:  # aspect ratio is kept; the corner follows whichever axis you drag further
             (ax, ay), (px, py) = self.resize, self.to_mm(e)
-            iw, ih = self.active['src'].size
+            iw, ih = self.active['size']
             s = max(abs(px - ax) / iw, abs(py - ay) / ih, 20 / iw)
             if not e.state & 4:  # Ctrl = no snapping
                 s = self.snap_scale(ax, ay, px, py, iw, ih, s)
@@ -1958,6 +2108,7 @@ class App:
         if self.cur and (self.drag or self.resize) and not self.pending:
             self.store()  # keeps the wallpaper's thumbnail in step with the layout
         self.pending = None
+        self.settle()
 
     def wheel(self, e):
         up = 1 if e.delta > 0 else -1
@@ -1968,7 +2119,7 @@ class App:
                 return
             f = (1.005 if e.state & 1 else 1.05) ** up
             ix, iy, s = L['place']
-            if not 50 < L['src'].width * s * f < 50000:  # mm; sane limits
+            if not 50 < L['size'][0] * s * f < 50000:  # mm; sane limits
                 return
             self.checkpoint_burst()
             L['place'] = [px - (px - ix) * f, py - (py - iy) * f, s * f]
@@ -1977,6 +2128,7 @@ class App:
             if not self.fit_k / 4 < k < self.fit_k * 40:
                 return
             self.view = (px - e.x / k, py - e.y / k, k)
+        self.interact()
         self.redraw()
 
     def nudge(self, dx, dy):
@@ -2008,17 +2160,41 @@ class App:
         self.redraw()
 
     def redraw(self):
+        """Ask for a redraw. Mouse moves arrive far faster than a frame can be drawn; drawing on each one
+        queued them up and the picture trailed the pointer. Now every request until Tk is idle again makes
+        one frame, with the latest positions."""
+        if not self.redraw_job:
+            self.redraw_job = self.root.after_idle(self.draw)
+
+    def draw(self):
+        self.redraw_job = None
         c = self.canvas
-        c.delete('all')
+        c.delete('ov')  # the lines and labels; the picture item stays and gets new pixels below
         size = (c.winfo_width(), c.winfo_height())
         if size[0] < 2:
             return
         ox, oy, k = self.view
-        if not self.angle_job:  # mid-drag the slider owns its value
-            self.sync_adj()
-        self.tkimg = ImageTk.PhotoImage(preview_image(self.layers, self.mons, self.view, size, step=self.step(),
-                                                      fill=self.fill()))
-        c.create_image(0, 0, anchor='nw', image=self.tkimg)
+        self.sync_adj()
+        # The picture is rebuilt only when something that shows in it changed; selection, guides, hover and
+        # handles are canvas items drawn on top, so clicking or hovering costs no rendering at all.
+        key = (tuple(self.view), size, self.step(), self.fill(), self.fast,
+               tuple((id(L), tuple(L['place']), L['angle'], L.get('rough'), tuple(L['xf']), tuple(L['crop'] or ()),
+                      tuple(sorted(L['adj'].items())), L.get('rotated', (None,))[0] == L['angle'])
+                     for L in self.layers),
+               tuple(tuple(m['mm']) for m in self.mons))
+        if key != self.frame_key:
+            self.frame_key = key
+            pic = preview_image(self.layers, self.mons, self.view, size, step=self.step(), fill=self.fill(),
+                                fast=self.fast)
+            if self.photo and (self.photo.width(), self.photo.height()) == size:
+                self.photo.paste(pic)  # same Tk image, new pixels: no item to delete and re-create
+            else:
+                self.photo = ImageTk.PhotoImage(pic)
+                c.delete('pic')
+                c.create_image(0, 0, anchor='nw', image=self.photo, tags='pic')
+        if any(L['angle'] and L.get('rotating') == L['angle'] and L.get('rotated', (None,))[0] != L['angle']
+               for L in self.layers):
+            self.root.after(150, self.redraw)  # a background rotation is still running: look again shortly
         if len(self.layers) > 1:  # outline every piece faintly, so split pieces are easy to find
             for L in self.layers:
                 if L is not self.active:
@@ -2048,6 +2224,8 @@ class App:
         if self.active:  # resize handles, above the monitor outlines
             for x, y in self.corners():
                 c.create_rectangle(x - 5, y - 5, x + 5, y + 5, fill='white', outline=INK, width=2)
+        c.addtag_all('ov')  # everything drawn above is an overlay, deleted at the next frame...
+        c.dtag('pic', 'ov')  # ...except the picture itself
 
 
 def selftest():
@@ -2073,7 +2251,7 @@ def selftest():
 
     # Split at the seam: two pieces that together render exactly like the whole image.
     pieces = split(line, mons)
-    assert len(pieces) == 2 and pieces[0]['src'].width + pieces[1]['src'].width == 2400
+    assert len(pieces) == 2 and pieces[0]['size'][0] + pieces[1]['size'][0] == 2400
     assert compose(pieces, mons).tobytes() == compose([line], mons).tobytes()
     # Stacked monitors cut horizontally; a third monitor to the right adds a vertical cut, not a second row cut.
     stacked = [dict(px=[0, 0, 3840, 2160], mm=[0, 0, 697, 392]), dict(px=[0, 2160, 2560, 1440], mm=[50, 600, 597, 336]),
@@ -2082,7 +2260,7 @@ def selftest():
     big = dict(orig=Image.new('RGBA', (2200, 1600), 'white'), place=[0, 0, 0.5])
     set_xf(big, (0, False))
     pieces = split(big, stacked)
-    assert len(pieces) == 4 and sorted(p['src'].size for p in pieces) == [(806, 608), (806, 992), (1394, 608), (1394, 992)]
+    assert len(pieces) == 4 and sorted(p['size'] for p in pieces) == [(806, 608), (806, 992), (1394, 608), (1394, 992)]
     assert split(big, stacked[:1]) == [big]
     # Flip/rotate keep the crop on the same pixels: rotating a piece 4 times or flipping twice is a no-op.
     mark = dict(orig=Image.new('RGBA', (40, 20), 'white'), place=[0, 0, 1])
@@ -2092,9 +2270,9 @@ def selftest():
         P = dict(mark, place=[0, 0, 1])
         for op in ops:
             turn(P, op)
-        assert P['src'].getpixel((1, 1)) == (255, 0, 0, 255), ops
+        assert source(P).getpixel((1, 1)) == (255, 0, 0, 255), ops
     turn(mark, 'rot')
-    assert mark['src'].size == (14, 28) and mark['src'].getpixel((14 - 1 - 1, 1)) == (255, 0, 0, 255)
+    assert mark['size'] == (14, 28) and source(mark).getpixel((14 - 1 - 1, 1)) == (255, 0, 0, 255)
     # Time of day: the most recently started slot, wrapping to yesterday's last one before the first.
     ps = [dict(time='07:00'), dict(), dict(time='19:30')]
     assert (pick_by_time(ps, '12:00'), pick_by_time(ps, '20:00'), pick_by_time(ps, '05:00')) == (0, 2, 2)
@@ -2105,11 +2283,15 @@ def selftest():
     darker = adjust(px, {'brightness': -50})
     assert darker.getpixel((0, 0)) == (50, 50, 50, 255) and darker.getpixel((1, 0))[3] == 0
     assert adjust(px, {'brightness': 0}) is px
+    # The size worked out for a tilted image is exactly the one Pillow's rotation produces.
+    for w_, h_ in ((7680, 4320), (1440, 2560), (333, 101)):
+        for deg in (1, 7.5, 33, 45, 90, -12, 179, 180):
+            assert rotated_size(w_, h_, deg) == Image.new('1', (w_, h_)).rotate(-deg, expand=True).size, (w_, h_, deg)
     # Free rotation turns around the centre; tilted images aren't split.
     tilt = dict(orig=Image.new('RGBA', (200, 100), 'white'), place=[0, 0, 1])
     set_xf(tilt, (0, False))
     set_angle(tilt, 90)
-    assert tilt['src'].size == (100, 200) and [round(v) for v in layer_rect(tilt)] == [50, -50, 100, 200]
+    assert source(tilt).size == tilt['size'] == (100, 200) and [round(v) for v in layer_rect(tilt)] == [50, -50, 100, 200]
     assert split(tilt, mons) == [tilt]
     # "Show when": a running app beats the theme; the theme rule follows dark/light.
     rules = [dict(when={'theme': 'dark'}), dict(), dict(when={'app': 'Game.exe'})]
