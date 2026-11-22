@@ -11,7 +11,10 @@ from one to the other lands at a different height on each. Spanwyse lays the ima
 monitors out in real millimetres, the way LittleBigMouse does for the cursor, and gives every
 monitor exactly what sits physically in front of it.
 
-Free, MIT, Windows 10 and 11. No account, no internet connection.
+Free, MIT, Windows 10 and 11. No account and no telemetry. The only thing it sends over the network is a
+check on GitHub for a newer version, at start and every six hours; a new version is verified against the
+SHA-256 GitHub publishes and installed in place. Untick *Check for updates automatically* and nothing
+contacts the network.
 
 ## Starting it
 

@@ -21,6 +21,7 @@ import random
 import re
 import sys
 import time
+import urllib.request
 import uuid
 import winreg
 import tkinter as tk
@@ -691,6 +692,60 @@ def fade_out(root, wins, wait=700, duration=900, steps=24):
         root.after(wait, step, 1)
 
 
+REPO = 'limburatorul/spanwyse'
+UPDATE_ASSET = 'Spanwyse.exe'
+
+
+def version_tuple(text):
+    return tuple(int(n) for n in re.findall(r'\d+', text))
+
+
+def update_in_place(exe, current=VERSION, api=f'https://api.github.com/repos/{REPO}/releases/latest'):
+    """In-place update, like the studio's other portable apps: the newest Spanwyse.exe from the GitHub release
+    is downloaded beside the running one, checked against the size and SHA-256 GitHub publishes for it, and
+    takes the old one's name (Windows lets a running exe be renamed; the old one becomes .old and is deleted
+    at the next start). Returns (version now waiting for the next start or None, whether the check failed):
+    failed means "couldn't check" (offline, GitHub busy, a file that didn't match), not "nothing newer"."""
+    headers = {'User-Agent': 'Spanwyse', 'Accept': 'application/vnd.github+json'}
+    fresh, old = exe + '.new', exe + '.old'
+    try:
+        with urllib.request.urlopen(urllib.request.Request(api, headers=headers), timeout=20) as r:
+            release = json.load(r)
+        latest = release['tag_name'].lstrip('vV')
+        if version_tuple(latest) <= version_tuple(current):
+            return None, False
+        asset = next(a for a in release['assets'] if a['name'] == UPDATE_ASSET)
+        digest = asset.get('digest') or ''
+        if not digest.startswith('sha256:'):  # nothing to check it against: it doesn't get to run
+            return None, True
+        sha, size = hashlib.sha256(), 0
+        with urllib.request.urlopen(urllib.request.Request(asset['browser_download_url'], headers=headers),
+                                    timeout=60) as r, open(fresh, 'wb') as f:
+            for chunk in iter(lambda: r.read(1 << 20), b''):
+                f.write(chunk)
+                sha.update(chunk)
+                size += len(chunk)
+        if size != asset['size'] or sha.hexdigest() != digest[7:].lower():  # cut short, or not the published file
+            os.remove(fresh)
+            return None, True
+        if os.path.exists(old):
+            os.remove(old)
+        os.rename(exe, old)
+        try:
+            os.rename(fresh, exe)
+        except OSError:
+            os.rename(old, exe)  # the folder is never left without its exe
+            raise
+        return latest, False
+    except (OSError, ValueError, KeyError, TypeError, StopIteration):
+        # Offline (URLError), rate limit or server error (HTTPError), an odd answer, a folder we can't write in.
+        try:
+            os.remove(fresh)
+        except OSError:
+            pass
+        return None, True
+
+
 def write_monitor_images(layers, mons, fill, prefix):
     """One PNG per monitor in APPLIED, with a fresh name each time (Windows caches by path)."""
     os.makedirs(APPLIED, exist_ok=True)
@@ -926,11 +981,13 @@ class App:
         saved = cfg.get('options', {})
         self.smooth = tk.BooleanVar(value=saved.get('smooth', True))
         self.stop_we = tk.BooleanVar(value=saved.get('stop_we', True))
+        self.auto_update = tk.BooleanVar(value=saved.get('updates', True))
         self.context = self.context_return = None  # wallpaper forced by a rule, and the one to go back to
         self.adj_vars = {key: tk.DoubleVar(value=0) for key, _, _ in ADJUSTMENTS}
         self.adj_vars['angle'] = tk.DoubleVar(value=0)
         self.redraw_job = self.settle_job = self.frame_key = self.photo = None
         self.fast = False
+        self.update_waiting = self.update_job = None
         self.apply_note = ''
         saved = cfg.get('grid', {})
         self.grid_step = tk.StringVar(value=str(saved.get('step', 10)))
@@ -958,6 +1015,12 @@ class App:
         self.schedule()
         root.after(2000, self.scan_watched)
         root.after(3000, self.check_context)
+        if FROZEN:
+            try:
+                os.remove(sys.executable + '.old')  # the copy an update set aside last time
+            except OSError:
+                pass
+            root.after(15000, self.check_updates)
 
     # --- layout ---
     def build_ui(self, glyphs):
@@ -981,10 +1044,18 @@ class App:
             anchor='w', pady=(4, 0))
         ttk.Checkbutton(foot, text='Stop Wallpaper Engine when applying', variable=self.stop_we,
                         command=self.store).pack(anchor='w', pady=(4, 0))
+        upd = ttk.Checkbutton(foot, text='Check for updates automatically', variable=self.auto_update,
+                              command=self.store)
+        upd.pack(anchor='w', pady=(4, 0))
+        self.tip(upd, 'At start and every six hours, Spanwyse asks GitHub for a newer version and installs it in '
+                      'place. Turn it off and nothing contacts the network.')
         ttk.Label(foot, text='Ctrl+Alt+← / → anywhere: previous / next wallpaper', style='Muted.TLabel').pack(
             anchor='w', pady=(6, 0))
-        ttk.Label(foot, text=f'Spanwyse {VERSION}  ·  free and open source (MIT)  ·  protagonistlabs.app',
-                  style='Muted.TLabel').pack(anchor='w', pady=(2, 0))
+        ver = ttk.Label(foot, text=f'Spanwyse {VERSION}  ·  free and open source (MIT)  ·  check for updates',
+                        style='Muted.TLabel', cursor='hand2')
+        ver.pack(anchor='w', pady=(2, 0))
+        ver.bind('<Button-1>', lambda e: self.check_updates(manual=True))
+        self.tip(ver, 'Spanwyse checks GitHub for a new version at start and every few hours; click to check now')
 
         panes = ttk.PanedWindow(side, orient='vertical')
         panes.pack(fill='both', expand=True)
@@ -1239,10 +1310,57 @@ class App:
                 m.add_command(label=('● ' if p['id'] == self.applied else '    ') + p['name'] +
                               ('\t▶' if p.get('show') else ''), command=lambda i=i: self.go(i))
         m.add_separator()
+        if self.update_waiting:
+            m.add_command(label=f'Restart to update to {self.update_waiting}', command=self.restart,
+                          font=(FONT, 10, 'bold'))
         m.add_command(label='Quit', command=self.quit)
         pt = w.POINT()
         user32.GetCursorPos(ctypes.byref(pt))
         m.tk_popup(pt.x, pt.y)
+
+    # --- updates ---
+    def check_updates(self, manual=False):
+        """In a thread: the network must not hold up the window. The automatic check stays quiet when there is
+        nothing new or it couldn't check, and runs again in six hours; a click always answers."""
+        if not manual:
+            self.root.after(6 * 3600 * 1000, self.check_updates)
+            if not self.auto_update.get():
+                return
+        if not FROZEN:
+            if manual:
+                self.status['text'] = 'Running from source: update with git pull. The exe updates itself.'
+            return
+        if self.update_waiting or self.update_job:
+            if manual and self.update_waiting:
+                self.status['text'] = f'Spanwyse {self.update_waiting} is ready: tray menu › Restart to update.'
+            return
+        if manual:
+            self.status['text'] = 'Checking for updates…'
+        result = []
+        threading.Thread(target=lambda: result.append(update_in_place(sys.executable)), daemon=True).start()
+
+        def done():
+            if not result:
+                self.update_job = self.root.after(300, done)
+                return
+            self.update_job = None
+            waiting, failed = result[0]
+            if waiting:
+                self.update_waiting = waiting
+                self.status['text'] = f'Updated to {waiting}: it opens at the next start (tray menu › Restart to update).'
+                if self.tray_ok:
+                    self.tray_balloon(f'Spanwyse {waiting} is downloaded. Restart it from this icon\'s menu, '
+                                      'or it opens next time.')
+            elif manual:
+                self.status['text'] = ('Couldn\'t check for updates: no connection or GitHub is busy. Try again later.'
+                                       if failed else f'You have the newest version ({VERSION}).')
+        self.update_job = self.root.after(300, done)
+
+    def restart(self):
+        """Start the updated exe (it already sits under this one's name) and close this one."""
+        self.store()
+        subprocess.Popen([sys.executable] + [a for a in sys.argv[1:] if a == '--tray'])
+        self.quit()
 
     def hotkeys(self):
         failed = [name for hid, vk, name in ((1, 0x27, '→'), (2, 0x25, '←'))
@@ -1462,7 +1580,7 @@ class App:
                    rotate=dict(on=self.rot_on.get(), min=self.rot_min.get(), mode=self.rot_mode.get(),
                                unit=self.rot_unit.get()),
                    grid=dict(step=self.grid_step.get(), snap=self.grid_snap.get()),
-                   options=dict(smooth=self.smooth.get(), stop_we=self.stop_we.get()))
+                   options=dict(smooth=self.smooth.get(), stop_we=self.stop_we.get(), updates=self.auto_update.get()))
         json.dump(cfg, open(CONFIG, 'w', encoding='utf-8'), indent=2, ensure_ascii=False)
 
     def select(self, _=None):
